@@ -9,6 +9,7 @@ import (
 
 	"go.inndy.tw/goxray/internal/config"
 	"go.inndy.tw/goxray/internal/store"
+	"go.inndy.tw/goxray/internal/wire"
 )
 
 // runCLI dispatches the read-only query subcommands.
@@ -17,6 +18,12 @@ func runCLI(cmd string, args []string) error {
 	if err != nil {
 		return err
 	}
+	// migrate-usage is the one subcommand that writes, so it does not open the
+	// read-only Reader.
+	if cmd == "migrate-usage" {
+		return cmdMigrateUsage(cfg, args)
+	}
+
 	rd, err := store.OpenReader(cfg.BlobsDir(), cfg.ManifestsDir(), cfg.IndexPath())
 	if err != nil {
 		return err
@@ -32,6 +39,34 @@ func runCLI(cmd string, args []string) error {
 		return cmdRaw(rd, args)
 	}
 	return fmt.Errorf("unknown command %q", cmd)
+}
+
+// cmdMigrateUsage backfills usage detail that older captures did not record,
+// re-parsing the stored response blobs. Dry-run unless --apply is passed.
+func cmdMigrateUsage(cfg *config.Config, args []string) error {
+	fs := flag.NewFlagSet("migrate-usage", flag.ContinueOnError)
+	apply := fs.Bool("apply", false, "write the changes (default is a dry run)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	st, err := store.MigrateUsage(cfg.BlobsDir(), cfg.ManifestsDir(), wire.Anthropic{}, *apply)
+	if err != nil {
+		return err
+	}
+
+	mode := "dry run"
+	if *apply {
+		mode = "applied"
+	}
+	fmt.Printf("%s: %d scanned, %d to update, %d skipped, %d failed\n",
+		mode, st.Scanned, st.Updated, st.Skipped, st.Failed)
+	fmt.Printf("cost with current rates: $%.4f -> $%.4f (%+.4f)\n",
+		st.CostFrom, st.CostTo, st.CostTo-st.CostFrom)
+	if *apply && st.Updated > 0 {
+		fmt.Println("delete index.db and restart to reproject the corrected costs")
+	}
+	return nil
 }
 
 func cmdLs(rd *store.Reader, args []string) error {

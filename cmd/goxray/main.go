@@ -34,7 +34,7 @@ func main() {
 	// else (or nothing) runs the proxy.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "ls", "show", "raw":
+		case "ls", "show", "raw", "migrate-usage":
 			if err := runCLI(os.Args[1], os.Args[2:]); err != nil {
 				fmt.Fprintln(os.Stderr, "goxray:", err)
 				os.Exit(1)
@@ -132,6 +132,7 @@ func printUsage() {
   goxray ls   [--session id]  list recorded exchanges (newest first)
   goxray show <id>            show one exchange's parsed metadata
   goxray raw  <id> [req|res]  dump verbatim recorded bytes (default req)
+  goxray migrate-usage        backfill usage detail from stored blobs (--apply)
 
 flags:
   --port N            listen port (env PROXY_PORT, default 5599)
