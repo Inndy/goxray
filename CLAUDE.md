@@ -207,6 +207,18 @@ Verified empirically: 403 for a foreign `Host`, wrong port, or remote `Origin`;
   before the TTL split was parsed has no `cache_creation_5m/1h`, so it bills at
   the 5m rate. `goxray migrate-usage --apply` recovers the split from the stored
   response blobs; until it is run on a store, those turns read ~26% low.
+- **A turn row shows a context percentage only once some turn of the same model
+  has been opened.** The `[1m]` marker lives in the system prompt, which only the
+  detail fetch parses, so the window is learned per (session, model) from loaded
+  details — rows of a model you have not opened render composition-only. Recording
+  the window into the request metadata at capture time would light up every row
+  without a detail load, at the cost of a manifest field and a backfill.
+- **`CtxWindow`'s 200K fallback is the client's window, not the model's.** The
+  `[1m]` marker records what Claude Code will *use*; on the current generation
+  Opus, Sonnet, and Fable are all 1M by default and only Haiku 4.5 is really
+  200K. The fallback is therefore right for a Haiku side-turn and low for a bare
+  Opus id. `GET /v1/models/{id}` reports `max_input_tokens` per model and would
+  replace the heuristic.
 - **No SSE replay buffer.** A dashboard that reconnects misses whatever streamed
   while it was away; it refetches the list instead. Fine for a local tool.
 - **`IsSubagent` is a heuristic** (`cwd == "" && sid == ""`) in
