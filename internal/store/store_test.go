@@ -131,6 +131,40 @@ func TestRecorderFlow(t *testing.T) {
 
 // A cost stamped at record time goes stale as soon as the rate table moves, so
 // reads must recompute it rather than trust what is on disk.
+// A failed recovery (or any lost upsert) must not be sealed by a clean-shutdown
+// mark, or the projection gap becomes permanent: the next start would skip
+// reconcile and the missing rows would never reappear.
+func TestDegradedIndexStaysUncleanUntilRecoverySucceeds(t *testing.T) {
+	d := t.TempDir()
+	path := filepath.Join(d, "index.db")
+
+	idx, _, _, err := OpenIndex(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.degraded.Store(true)
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	idx, _, wasClean, err := OpenIndex(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wasClean {
+		t.Error("degraded close reported clean shutdown; next start would skip reconcile")
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	idx, _, wasClean, err = OpenIndex(path)
+	if err != nil || !wasClean {
+		t.Errorf("healthy close should mark clean (wasClean=%v, err=%v)", wasClean, err)
+	}
+	idx.Close()
+}
+
 // A handler that outlives the shutdown deadline can reach a closed store; the
 // late writes must degrade to errors/no-ops, never a send-on-closed-channel
 // panic (an overflow-goroutine panic would take the whole process down).

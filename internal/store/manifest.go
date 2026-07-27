@@ -71,7 +71,10 @@ func (m *localManifests) EachID(fn func(id string) error) error {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
 			}
-			return nil // skip unreadable entries rather than abort the whole scan
+			// Skip unreadable entries rather than abort the whole scan, but say
+			// so — a silently skipped shard is an invisible hole in the index.
+			logf("manifest scan: skipping %s: %v", p, err)
+			return nil
 		}
 		if d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
 			return nil

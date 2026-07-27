@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"sync/atomic"
+
 	_ "modernc.org/sqlite" // pure-Go driver, registered as "sqlite"
 
 	"go.inndy.tw/goxray/internal/model"
@@ -110,6 +112,12 @@ type Index struct {
 	// surviving a shutdown deadline) must degrade to an error, not a crash.
 	mu     sync.RWMutex
 	closed bool
+
+	// degraded flips when a rebuild, reconcile, or upsert failed: the projection
+	// may be missing rows the manifests have. Close then leaves the shutdown
+	// marked unclean so the next start reconciles instead of trusting a clean
+	// flag that would make the gap permanent.
+	degraded atomic.Bool
 }
 
 var errIndexClosed = errors.New("index closed")
@@ -177,7 +185,11 @@ func (i *Index) Upsert(ex model.Exchange) error {
 	}
 	i.writeCh <- writeReq{ex: ex, resp: resp}
 	i.mu.RUnlock()
-	return <-resp
+	err := <-resp
+	if err != nil {
+		i.degraded.Store(true)
+	}
+	return err
 }
 
 func doUpsert(stmt *sql.Stmt, ex *model.Exchange) error {
@@ -338,8 +350,18 @@ func querySessions(db *sql.DB, f Filter) ([]Session, error) {
 }
 
 // RebuildFrom wipes the projection and replays every manifest. Used on schema
-// bump or a missing DB. Unreadable/torn manifests are skipped, not fatal.
+// bump or a missing DB. Unreadable/torn manifests are skipped, not fatal. Any
+// failure marks the index degraded so Close leaves the shutdown unclean and
+// the next start retries recovery.
 func (i *Index) RebuildFrom(m ManifestStore) error {
+	err := i.rebuildFrom(m)
+	if err != nil {
+		i.degraded.Store(true)
+	}
+	return err
+}
+
+func (i *Index) rebuildFrom(m ManifestStore) error {
 	if _, err := i.db.Exec(`DELETE FROM entries`); err != nil {
 		return err
 	}
@@ -362,8 +384,18 @@ func (i *Index) RebuildFrom(m ManifestStore) error {
 
 // Reconcile upserts manifests missing from the index (crash recovery for lost
 // async Upserts). It loads existing ids once, then walks manifest filenames and
-// reads only the stragglers — cheap when the queue was nearly drained.
+// reads only the stragglers — cheap when the queue was nearly drained. Any
+// failure marks the index degraded so Close leaves the shutdown unclean and
+// the next start retries recovery.
 func (i *Index) Reconcile(m ManifestStore) error {
+	err := i.reconcile(m)
+	if err != nil {
+		i.degraded.Store(true)
+	}
+	return err
+}
+
+func (i *Index) reconcile(m ManifestStore) error {
 	have := map[string]struct{}{}
 	rows, err := i.db.Query(`SELECT id FROM entries`)
 	if err != nil {
@@ -407,7 +439,11 @@ func (i *Index) Close() error {
 	close(i.writeCh)
 	i.mu.Unlock()
 	<-i.done // writer drained
-	setMeta(i.db, "clean_shutdown", "1")
+	if i.degraded.Load() {
+		log.Printf("goxray: index degraded (failed rebuild/reconcile/upsert); leaving shutdown unclean so next start reconciles")
+	} else {
+		setMeta(i.db, "clean_shutdown", "1")
+	}
 	return i.db.Close()
 }
 
