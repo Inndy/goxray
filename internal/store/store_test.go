@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"path/filepath"
@@ -259,17 +260,62 @@ func TestManifestReadRepricesStoredCost(t *testing.T) {
 		t.Errorf("cost = %v, want %v recomputed from tokens", got.Res.Cost, want)
 	}
 
-	// A wrong figure already on disk must lose to the derived one, not win.
+	// Write must leave no cost on disk, and must not zero the caller's copy —
+	// recorder projects that same struct into the index and the live feed.
 	ex.Res.Cost = 999
 	if err := man.Write(ex); err != nil {
 		t.Fatal(err)
 	}
+	if ex.Res.Cost != 999 {
+		t.Errorf("Write mutated the caller's exchange: cost = %v", ex.Res.Cost)
+	}
+	raw, err := readFile(man.path(ex.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk struct {
+		Res map[string]json.RawMessage `json:"res"`
+	}
+	if err := json.Unmarshal(raw, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := onDisk.Res["cost"]; ok {
+		t.Errorf("manifest persisted a cost: %s", raw)
+	}
+	if _, ok := onDisk.Res["usage"]; !ok {
+		t.Errorf("manifest lost usage: %s", raw)
+	}
+
 	got, err = man.Read(ex.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Res.Cost != 30.0 {
+		t.Errorf("cost = %v, want %v derived on read", got.Res.Cost, 30.0)
+	}
+}
+
+// Manifests written before the field was dropped still carry a cost. Reading one
+// must reprice rather than trust it.
+func TestManifestReadIgnoresLegacyStoredCost(t *testing.T) {
+	man := newLocalManifests(filepath.Join(t.TempDir(), "manifests"))
+	id := "00000000-0000-7000-8000-00000000dd02"
+	legacy := `{"id":"` + id + `","state":"complete","capture_ver":1,` +
+		`"req":{"model":"claude-opus-5"},` +
+		`"res":{"usage":{"input_tokens":1000000,"output_tokens":1000000},"cost":999}}`
+	if err := writeFileSync(man.path(id), []byte(legacy)); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := man.Read(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Res.Cost != 30.0 {
 		t.Errorf("stale stored cost survived read: %v", got.Res.Cost)
+	}
+	if got.Res.Usage.InputTokens != 1_000_000 || got.State != model.StateComplete {
+		t.Errorf("legacy manifest did not round-trip: %+v", got)
 	}
 }
 
@@ -283,7 +329,8 @@ func TestRebuildFromManifests(t *testing.T) {
 	// Two manifests written directly (as if by a prior run).
 	for _, id := range []string{"00000000-0000-7000-8000-0000000000aa", "00000000-0000-7000-8000-0000000000bb"} {
 		ex := &model.Exchange{ID: id, Provider: model.ProviderAnthropic, State: model.StateComplete,
-			Req: model.ReqMeta{Model: "claude-opus-4-8", SessionID: "s"}}
+			Req: model.ReqMeta{Model: "claude-opus-4-8", SessionID: "s"},
+			Res: model.ResMeta{Usage: model.Usage{InputTokens: 1_000_000, OutputTokens: 1_000_000}}}
 		if err := man.Write(ex); err != nil {
 			t.Fatal(err)
 		}
@@ -305,6 +352,13 @@ func TestRebuildFromManifests(t *testing.T) {
 	}
 	if len(rows) != 2 {
 		t.Errorf("rebuild produced %d rows, want 2", len(rows))
+	}
+	// Manifests carry no cost, so the projection is only as good as the
+	// repricing Read does on the way in.
+	for _, r := range rows {
+		if r.Res.Cost <= 0 {
+			t.Errorf("rebuilt row %s has cost %v, want it derived from tokens", r.ID, r.Res.Cost)
+		}
 	}
 	_ = idx.Close()
 	_ = blobsDir

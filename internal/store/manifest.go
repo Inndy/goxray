@@ -36,20 +36,25 @@ func (m *localManifests) path(id string) string {
 	return shardPath(m.dir, id, ".json")
 }
 
+// Write records the exchange with its cost stripped: the rate table moves, so a
+// figure frozen here would be a stale claim in a record whose whole point is
+// that it stays true. Read derives it instead. Zeroed on a copy because callers
+// go on to project the live value into the index and push it to the dashboard.
 func (m *localManifests) Write(ex *model.Exchange) error {
-	data, err := json.Marshal(ex)
+	rec := *ex
+	rec.Res.Cost = 0
+	data, err := json.Marshal(&rec)
 	if err != nil {
 		return err
 	}
 	return writeFileSync(m.path(ex.ID), data)
 }
 
-// Read returns the manifest with its cost recomputed from the stored token
-// counts. The persisted figure is only what the rate table said at record time,
-// and that table moves — a model can be unpriced when captured and priced later.
-// Repricing here rather than at each call site means the index rebuild, the
-// dashboard and the CLI cannot disagree, and a rate change needs no rewrite of
-// the audit records: delete index.db and restart.
+// Read returns the manifest with its cost computed from the stored token counts.
+// Manifests written before the field was dropped still carry one; it loses to
+// the derived figure. Repricing here rather than at each call site means the
+// index rebuild, the dashboard and the CLI cannot disagree, and a rate change
+// needs no rewrite of the audit records: delete index.db and restart.
 func (m *localManifests) Read(id string) (*model.Exchange, error) {
 	data, err := readFile(m.path(id))
 	if err != nil {

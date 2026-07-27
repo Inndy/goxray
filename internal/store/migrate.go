@@ -121,7 +121,6 @@ func MigrateUsage(blobsDir, manifestsDir string, parser wire.WireParser, apply b
 		if !apply {
 			return nil
 		}
-		ex.Res.Cost = pricing.Price(ex.Res, ex.Req.Model)
 		return manifests.Write(&ex)
 	})
 	if errors.Is(err, os.ErrNotExist) {

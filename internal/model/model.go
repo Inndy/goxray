@@ -80,11 +80,12 @@ type ResMeta struct {
 	// ServiceTier scales the rate: batch is half price. Empty on older captures,
 	// treated as standard.
 	ServiceTier string `json:"service_tier,omitempty"`
-	// Cost is derived, not authoritative. Rate tables change (a model can be
-	// unpriced when recorded and priced later), so every read reprices from the
-	// stored token counts; the persisted number is only a cache of what the
-	// table said at record time.
-	Cost float64 `json:"cost"`
+	// Cost is derived on read, never persisted. Rate tables change (a model can
+	// be unpriced when recorded and priced later), so the manifest stores only
+	// the token counts and every read reprices from them; a figure frozen at
+	// record time would be a stale claim in an otherwise verbatim audit record.
+	// It is still carried on the wire — the dashboard and index consume it.
+	Cost float64 `json:"cost,omitempty"`
 }
 
 // Exchange is the audit record for one request→response pair. Serialized as the
