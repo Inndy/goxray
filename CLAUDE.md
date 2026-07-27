@@ -30,7 +30,8 @@ Merge when ready: `git switch main && git merge --ff-only feat/dashboard-ui`
 tagging, noise classification, unclean-shutdown reconcile. Verbatim capture, so
 an API shape change can only null a parsed field (`parse_ok=0`), never lose data.
 
-**CLI.** `goxray ls | show | raw`, all read-only through `store.Reader`.
+**CLI.** `goxray ls | show | raw`, all read-only through `store.Reader`, plus
+`goxray migrate-usage` — the one writing subcommand.
 
 **Dashboard (this cycle).** `--ui-port N` starts a second, read-only HTTP server
 inside the `serve` process. Sessions → turns → detail with four tabs (Timeline /
@@ -122,6 +123,23 @@ capture rather than porting blind:
   plus Haiku 4.5. Everything older was **removed on purpose**. An unpriced model
   yields `$0` plus an explicit "no price on file" warning, which is better than a
   stale rate rendered as a confident dollar figure.
+- **Cost is derived, never stored truth.** `localManifests.Read` reprices from
+  the stored token counts on every read, so the index, dashboard and CLI cannot
+  disagree. The number in the manifest is only what the table said at record
+  time. Editing a rate therefore needs no manifest rewrite: change the table,
+  delete `index.db`, restart. This replaced a real incident — 200 turns recorded
+  before Opus 5 was in the table were stuck at `$0` and had to be repaired by
+  hand.
+- **Cache writes bill by TTL**, 1.25x input for 5m and 2x for 1h, so
+  `usage.cache_creation.{ephemeral_5m,ephemeral_1h}` is parsed and priced
+  separately. Measured on a real capture, 44% of cache-write tokens were 1h;
+  charging the flat total at the 5m rate underpriced cache writes by 26%.
+  `cacheWriteCost` keys on *which fields are populated*, not on a capture
+  version, so a pre-split capture still prices at the flat 5m rate instead of
+  falling to zero.
+- Pricing prefers the model id the **response** reported over the request's
+  alias, and halves the rate for `service_tier: batch`. Priority tier is
+  account-negotiated and deliberately left at 1x.
 
 ### The timeline shows the response, not the next turn's echo
 
@@ -182,17 +200,15 @@ Verified empirically: 403 for a foreign `Host`, wrong port, or remote `Origin`;
 
 - **Turn titles are mostly empty.** Only Claude Code's title-generation turns
   populate `res.title`. A first-user-message excerpt would be a better fallback.
-- **Historical captures show `cost: 0`.** Cost is stamped at record time and
-  manifests are immutable, so anything recorded before a model was priced stays
-  at zero. Fix by computing cost at *query* time from stored token counts
-  instead of trusting the stamped field.
-- **1h cache writes are underpriced.** `Calc` applies the 5m rate to the flat
-  `CacheCreateTokens`. Splitting them needs
-  `usage.cache_creation.{ephemeral_5m,ephemeral_1h}` plumbed through the wire
-  parser.
 - **Sonnet 5 introductory pricing expires 2026-08-31.** On 2026-09-01 change
   `claude-sonnet-5` to the 4.6 tier `{3, 15, 0.30, 3.75, 6}`. There is no
-  timestamp available in `Calc` to switch on automatically.
+  timestamp available in `Calc` to switch on automatically. Since costs are
+  derived on read, the whole procedure is: edit the table, delete `index.db`,
+  restart.
+- **Pre-migration captures still price cache writes flat.** Anything recorded
+  before the TTL split was parsed has no `cache_creation_5m/1h`, so it bills at
+  the 5m rate. `goxray migrate-usage --apply` recovers the split from the stored
+  response blobs; until it is run on a store, those turns read ~26% low.
 - **No SSE replay buffer.** A dashboard that reconnects misses whatever streamed
   while it was away; it refetches the list instead. Fine for a local tool.
 - **`IsSubagent` is a heuristic** (`cwd == "" && sid == ""`) in
@@ -237,6 +253,22 @@ pnpm -C ui format  # oxfmt src/
 ```
 
 Run the dashboard: `./goxray --port 5599 --ui-port 5600`
+
+**Repairing a store after a pricing change.** Costs are derived on read, so a
+rate edit only needs `rm ~/.goxray/index.db*` and a restart. Recovering usage
+detail an older capture never parsed is the separate, one-time step:
+
+```bash
+goxray migrate-usage            # dry run: what would change, and the cost delta
+goxray migrate-usage --apply    # rewrite manifests, then delete index.db
+```
+
+It re-parses response blobs through the live `WireParser` — the only place the
+cache TTL split survives — deliberately breaking the "blobs are never re-parsed"
+rule that holds for index rebuilds. Reusing the parser is not optional: a stream
+reports usage in several events, so anything that sums instead of assigning
+double-counts. Safe against a running proxy (inflight and sub-minute-old
+manifests are skipped, writes are atomic renames) and idempotent.
 
 **Vite dev proxy needs `changeOrigin: true`** or the guard rejects the
 dev-proxied `Host`. Already set in `ui/vite.config.js`; do not remove it.
