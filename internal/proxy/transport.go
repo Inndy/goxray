@@ -83,7 +83,7 @@ func (t *httpTransport) Handle(w http.ResponseWriter, r *http.Request, up *url.U
 	if isSSE(resp.Header.Get("content-type")) {
 		return t.streamSSE(w, resp, ex, rec, timer, &timedOut)
 	}
-	return t.bufferNonSSE(w, resp, ex, rec, maxBody, &timedOut)
+	return t.bufferNonSSE(w, resp, ex, rec, &timedOut)
 }
 
 // finalizeNoResponse records an exchange that never produced a client-visible
@@ -181,9 +181,12 @@ func (t *httpTransport) streamSSE(w http.ResponseWriter, resp *http.Response, ex
 
 // bufferNonSSE handles non-streaming responses: buffer fully, commit, THEN write
 // to the client — so a header-only/204 response can still return an honest 502
-// on persist failure.
-func (t *httpTransport) bufferNonSSE(w http.ResponseWriter, resp *http.Response, ex *model.Exchange, rec Recorder, maxBody int64, timedOut *atomic.Bool) error {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+// on persist failure. The read is deliberately uncapped: maxBody bounds what
+// clients may send, but capping the upstream's reply would silently truncate a
+// verbatim record and hand the client a cut body it cannot detect (the proxy
+// strips content-length). The SSE path is likewise unbounded.
+func (t *httpTransport) bufferNonSSE(w http.ResponseWriter, resp *http.Response, ex *model.Exchange, rec Recorder, timedOut *atomic.Bool) error {
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		ex.State = upstreamState(timedOut)
 		if perr := rec.PersistResponse(ex, body); perr != nil {

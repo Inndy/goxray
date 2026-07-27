@@ -269,6 +269,49 @@ func TestFailClosedResponseAbortsStream(t *testing.T) {
 	}
 }
 
+// A non-SSE response larger than the request-body cap must still be recorded
+// and relayed byte-exact: maxBody bounds clients, never the upstream's reply.
+func TestNonSSELargeResponseNotTruncated(t *testing.T) {
+	var hits atomic.Int64
+	jsonBody := `{"type":"message","big":"` + strings.Repeat("x", 4096) + `"}`
+	up := mockUpstream(t, &hits, false, jsonBody)
+	defer up.Close()
+
+	d := t.TempDir()
+	st, _ := store.Open(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"),
+		filepath.Join(d, "index.db"), model.ProviderAnthropic, 2)
+	cfg := testCfg(t, up.URL)
+	cfg.MaxBodyBytes = 1024
+	srv := New(cfg, st.Recorder)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(got) != jsonBody {
+		t.Errorf("client body truncated: got %d bytes, want %d", len(got), len(jsonBody))
+	}
+	st.Close()
+
+	rd, _ := store.OpenReader(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "index.db"))
+	defer rd.Close()
+	rows, _ := rd.List(store.Filter{Limit: 10})
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(rows))
+	}
+	raw, err := rd.Blob(rows[0].ResRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != jsonBody {
+		t.Errorf("stored response truncated: got %d bytes, want %d", len(raw), len(jsonBody))
+	}
+}
+
 func TestNonSSECommitsBeforeClientWrite(t *testing.T) {
 	var hits atomic.Int64
 	jsonBody := `{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":4}}`
