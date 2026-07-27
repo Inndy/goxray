@@ -42,16 +42,21 @@ function joinText(blocks) {
  *   - role:"system" messages surfaced rather than dropped; current Claude Code
  *     puts substantial context there and it is easy to miss otherwise
  *
+ * `response` is this turn's own reply, reassembled server-side. It is appended
+ * because a request only ever contains the conversation up to the point the
+ * model was asked to speak — the reply itself would otherwise appear nowhere
+ * until the next turn quotes it back, and the newest turn never gets one.
+ *
  * Returns a flat array so the list stays trivially virtualizable and each step
  * can carry its own message indices back to the raw view.
  */
-export function mergeSteps(messages) {
-  if (!Array.isArray(messages)) return []
+export function mergeSteps(messages, response) {
+  const list = Array.isArray(messages) ? messages : []
 
   // A tool_result can appear in any later user message, so index them all first.
   const resultMap = new Map()
   const knownToolUseIds = new Set()
-  for (const m of messages) {
+  for (const m of list) {
     for (const b of blocksOf(m.content)) {
       if (b.type === 'tool_result' && b.tool_use_id) resultMap.set(b.tool_use_id, b)
       if (b.type === 'tool_use' && b.id) knownToolUseIds.add(b.id)
@@ -59,7 +64,7 @@ export function mergeSteps(messages) {
   }
 
   const steps = []
-  messages.forEach((m, i) => {
+  list.forEach((m, i) => {
     const blocks = blocksOf(m.content)
     if (m.role === 'system') {
       pushSystem(steps, blocks, i)
@@ -71,7 +76,29 @@ export function mergeSteps(messages) {
       steps.push({ type: 'other', role: m.role, text: joinText(blocks), msgIndices: [i] })
     }
   })
+  pushResponse(steps, response)
   return steps
+}
+
+// RESPONSE_MSG_INDEX marks a step that came from the response rather than from
+// messages[], so nothing tries to index back into the request array with it.
+const RESPONSE_MSG_INDEX = -1
+
+function pushResponse(steps, response) {
+  const blocks = blocksOf(response?.content)
+  if (!blocks.length) return
+
+  const at = steps.length
+  // No result map: a call made in this turn is answered in the *next* request,
+  // so its result cannot exist here by definition.
+  pushAssistant(steps, blocks, RESPONSE_MSG_INDEX, new Map())
+
+  for (const s of steps.slice(at)) {
+    s.fromResponse = true
+    s.stopReason = response.stop_reason || ''
+    s.truncated = Boolean(response.truncated)
+    for (const c of s.calls || []) c.fromResponse = true
+  }
 }
 
 function pushSystem(steps, blocks, i) {
@@ -144,6 +171,8 @@ function pushAssistant(steps, blocks, i, resultMap) {
         name: u.name || '(unnamed)',
         preview: toolPreview(u.name, u.input),
         input: u.input,
+        // Set when the argument JSON was cut mid-stream and never parsed.
+        partialInput: u.partial_input || '',
         toolUseId: u.id,
         result: result ? result.content : null,
         isError: Boolean(result?.is_error),

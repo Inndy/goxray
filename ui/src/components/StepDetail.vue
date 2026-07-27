@@ -34,7 +34,10 @@ const paragraphs = (t) =>
     <template v-else-if="call">
       <div class="hd">
         <span class="tool">{{ call.name }}</span>
-        <NTag v-if="call.pending" size="tiny" type="warning" :bordered="false"
+        <NTag v-if="call.fromResponse" size="tiny" type="info" :bordered="false"
+          >this turn's call</NTag
+        >
+        <NTag v-else-if="call.pending" size="tiny" type="warning" :bordered="false"
           >no result recorded</NTag
         >
         <NTag v-else-if="call.isError" size="tiny" type="error" :bordered="false">error</NTag>
@@ -43,14 +46,26 @@ const paragraphs = (t) =>
       </div>
       <div v-if="call.preview" class="preview mono">{{ call.preview }}</div>
 
-      <h4>Input</h4>
-      <pre class="code">{{ prettyJSON(call.input) }}</pre>
+      <h4>
+        Input
+        <span v-if="call.partialInput" class="muted">cut off mid-stream</span>
+      </h4>
+      <NAlert v-if="call.partialInput" type="warning" :bordered="false" class="note">
+        The argument JSON never finished arriving, so this is the raw fragment rather than a parsed
+        input.
+      </NAlert>
+      <pre v-if="call.partialInput" class="code wrap">{{ call.partialInput }}</pre>
+      <pre v-else class="code">{{ prettyJSON(call.input) }}</pre>
 
       <h4>
         Output
         <span v-if="lineCount" class="muted">{{ lineCount }} lines</span>
       </h4>
-      <NAlert v-if="call.pending" type="warning" :bordered="false" class="note">
+      <NAlert v-if="call.fromResponse" type="info" :bordered="false" class="note">
+        This call was made by the reply being viewed. Its result is sent back in the
+        <em>next</em> request, so open the following turn to see what it returned.
+      </NAlert>
+      <NAlert v-else-if="call.pending" type="warning" :bordered="false" class="note">
         This call had no matching tool_result in the request — it was still outstanding when the
         request was assembled.
       </NAlert>
@@ -99,7 +114,13 @@ const paragraphs = (t) =>
     </template>
 
     <template v-else-if="step.type === 'assistant-text'">
-      <div class="hd"><span class="tool">🤖 Assistant</span></div>
+      <div class="hd">
+        <span class="tool">🤖 Assistant</span>
+        <NTag v-if="step.fromResponse" size="tiny" type="info" :bordered="false"
+          >this turn's response</NTag
+        >
+        <NTag v-if="step.truncated" size="tiny" type="warning" :bordered="false">truncated</NTag>
+      </div>
       <template v-if="step.thinking">
         <h4>Thinking</h4>
         <p v-for="(p, i) in paragraphs(step.thinking)" :key="i" class="para think">{{ p }}</p>

@@ -26,7 +26,7 @@ const tab = ref('timeline')
 const selected = ref(null)
 
 const ex = computed(() => props.detail?.exchange || null)
-const steps = computed(() => mergeSteps(props.detail?.messages))
+const steps = computed(() => mergeSteps(props.detail?.messages, props.detail?.response?.message))
 const usage = computed(() => ex.value?.res?.usage || null)
 
 const selectedStep = computed(() =>

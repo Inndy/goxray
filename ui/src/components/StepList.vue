@@ -22,12 +22,32 @@ const clip = (s, n) => {
 // unit instead of as unrelated consecutive rows.
 const bracket = (idx, len) => (len === 1 ? '─' : idx === 0 ? '┌' : idx === len - 1 ? '└' : '│')
 
-const callIcon = (c) => (c.pending ? '⏳' : c.isError ? '✗' : '✓')
+// A call made in this turn's reply has no result yet by definition, so the
+// "outstanding" hourglass would be misleading — it went out, we just cannot see
+// the answer from here.
+const callIcon = (c) => (c.fromResponse ? '→' : c.pending ? '⏳' : c.isError ? '✗' : '✓')
+
+const isFirstResponse = (i) => props.steps[i]?.fromResponse && !props.steps[i - 1]?.fromResponse
 </script>
 
 <template>
   <div class="steps">
     <template v-for="(step, i) in steps" :key="i">
+      <!-- everything below this rule is what the model produced in this turn,
+           reassembled from the response rather than read out of messages[] -->
+      <div v-if="isFirstResponse(i)" class="respsep">
+        <span class="rule" />
+        <span class="label">this turn's response</span>
+        <NTag v-if="step.stopReason" size="tiny" :bordered="false">{{ step.stopReason }}</NTag>
+        <NTooltip v-if="step.truncated" trigger="hover">
+          <template #trigger>
+            <NTag size="tiny" type="warning" :bordered="false">truncated</NTag>
+          </template>
+          The stream never reached message_stop — this is a prefix of the reply
+        </NTooltip>
+        <span class="rule" />
+      </div>
+
       <!-- human turn: the boundary a reader scans for -->
       <div
         v-if="step.type === 'human'"
@@ -73,7 +93,7 @@ const callIcon = (c) => (c.pending ? '⏳' : c.isError ? '✗' : '✓')
       <div
         v-else-if="step.type === 'assistant-text'"
         class="step assistant"
-        :class="{ sel: isSel(i) }"
+        :class="{ sel: isSel(i), resp: step.fromResponse }"
         @click="emit('select', { stepIdx: i, callIdx: null })"
       >
         <div v-if="step.thinking" class="thinking">🧠 {{ clip(step.thinking, 90) }}</div>
@@ -84,7 +104,11 @@ const callIcon = (c) => (c.pending ? '⏳' : c.isError ? '✗' : '✓')
         </div>
       </div>
 
-      <div v-else-if="step.type === 'tool-group'" class="step group">
+      <div
+        v-else-if="step.type === 'tool-group'"
+        class="step group"
+        :class="{ resp: step.fromResponse }"
+      >
         <div
           v-if="step.thinking"
           class="thinking clickable"
@@ -172,6 +196,29 @@ const callIcon = (c) => (c.pending ? '⏳' : c.isError ? '✗' : '✓')
 }
 .assistant {
   background: var(--gx-assistant-bg);
+}
+/* The reply came from the response body, not from messages[]. */
+.resp {
+  border-left-color: var(--gx-ok-dim);
+}
+.respsep {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 2px;
+  padding: 0 8px;
+  font-size: 10px;
+  color: var(--gx-ok);
+}
+.respsep .rule {
+  flex: 1;
+  height: 1px;
+  background: var(--gx-ok-dim);
+}
+.respsep .label {
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  flex: none;
 }
 .system {
   color: var(--gx-dim);
