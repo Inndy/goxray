@@ -1,7 +1,6 @@
 package wire
 
 import (
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"regexp"
@@ -167,45 +166,35 @@ func parseSSE(raw []byte) (model.ResMeta, bool) {
 	var any bool
 	var text strings.Builder
 
-	// Split into frames on blank lines; tolerate CRLF.
-	norm := bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
-	for _, frame := range bytes.Split(norm, []byte("\n\n")) {
-		for _, line := range bytes.Split(frame, []byte("\n")) {
-			if !bytes.HasPrefix(line, []byte("data:")) {
-				continue
+	SplitSSEData(raw, func(payload []byte) bool {
+		var d sseData
+		if json.Unmarshal(payload, &d) != nil {
+			return true
+		}
+		any = true
+		switch d.Type {
+		case "message_start":
+			if d.Message != nil && d.Message.Usage != nil {
+				applyUsage(&meta.Usage, d.Message.Usage)
 			}
-			payload := bytes.TrimSpace(line[len("data:"):])
-			if len(payload) == 0 || payload[0] != '{' {
-				continue
+		case "message_delta":
+			if d.Usage != nil && d.Usage.OutputTokens > 0 {
+				meta.Usage.OutputTokens = d.Usage.OutputTokens
 			}
-			var d sseData
-			if json.Unmarshal(payload, &d) != nil {
-				continue
+			if d.Delta != nil && d.Delta.StopReason != "" {
+				meta.StopReason = d.Delta.StopReason
 			}
-			any = true
-			switch d.Type {
-			case "message_start":
-				if d.Message != nil && d.Message.Usage != nil {
-					applyUsage(&meta.Usage, d.Message.Usage)
-				}
-			case "message_delta":
-				if d.Usage != nil && d.Usage.OutputTokens > 0 {
-					meta.Usage.OutputTokens = d.Usage.OutputTokens
-				}
-				if d.Delta != nil && d.Delta.StopReason != "" {
-					meta.StopReason = d.Delta.StopReason
-				}
-			case "content_block_delta":
-				if d.Delta != nil && d.Delta.Type == "text_delta" {
-					text.WriteString(d.Delta.Text)
-				}
-			case "content_block_start":
-				if d.ContentBlock != nil && d.ContentBlock.Type == "text" {
-					text.WriteString(d.ContentBlock.Text)
-				}
+		case "content_block_delta":
+			if d.Delta != nil && d.Delta.Type == "text_delta" {
+				text.WriteString(d.Delta.Text)
+			}
+		case "content_block_start":
+			if d.ContentBlock != nil && d.ContentBlock.Type == "text" {
+				text.WriteString(d.ContentBlock.Text)
 			}
 		}
-	}
+		return true
+	})
 	meta.Title = extractTitle(text.String())
 	return meta, any
 }
