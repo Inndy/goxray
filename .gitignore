@@ -1,2 +1,8 @@
 /goxray
 /goxray.exe
+
+ui/node_modules/
+.DS_Store
+
+# internal/web/dist is intentionally NOT ignored: the built dashboard is
+# committed so `go install` produces a working binary without a Node toolchain.

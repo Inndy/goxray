@@ -1,0 +1,69 @@
+/* Palette. The two owner colors carry meaning and are reused everywhere:
+   accent = shipped by Claude Code, ok/green = came from the user's machine. */
+:root {
+  --gx-fg: #c9d1d9;
+  --gx-dim: #7d8590;
+  --gx-border: #21262d;
+  --gx-hover: #161b22;
+  --gx-active: #1f2733;
+  --gx-code-bg: #0d1117;
+  --gx-track: #21262d;
+
+  --gx-accent: #58a6ff;
+  --gx-accent-dim: #1f3d5c;
+  --gx-ok: #3fb950;
+  --gx-ok-dim: #245c2e;
+  --gx-ok-bg: #10261550;
+  --gx-warn: #d29922;
+  --gx-error: #f85149;
+  --gx-think: #a371f7;
+  --gx-cost: #e3b341;
+
+  --gx-cache-read: #3fb950;
+  --gx-cache-write: #d29922;
+  --gx-input: #58a6ff;
+
+  --gx-human-bg: #58a6ff12;
+  --gx-assistant-bg: #3fb95010;
+
+  --gx-cred-bg: #f8514933;
+  --gx-cred-fg: #ffa198;
+
+  --gx-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  color: var(--gx-fg);
+  overflow: hidden;
+}
+
+/* Dense scrollbars; these panes are scrolled constantly. */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-thumb {
+  background: #30363d;
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #484f58;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+button {
+  font-family: inherit;
+}
