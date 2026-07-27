@@ -103,25 +103,22 @@ func extractCwd(system json.RawMessage) string {
 	if len(system) == 0 {
 		return ""
 	}
-	var txt string
 	var s string
 	if json.Unmarshal(system, &s) == nil {
-		txt = s
-	} else {
-		var blocks []struct {
-			Text string `json:"text"`
+		if m := reCwd.FindStringSubmatch(s); m != nil {
+			return strings.TrimSpace(m[1])
 		}
-		if json.Unmarshal(system, &blocks) == nil {
-			var b strings.Builder
-			for _, bl := range blocks {
-				b.WriteString(bl.Text)
-				b.WriteByte('\n')
-			}
-			txt = b.String()
-		}
+		return ""
 	}
-	if m := reCwd.FindStringSubmatch(txt); m != nil {
-		return strings.TrimSpace(m[1])
+	var blocks []struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(system, &blocks) == nil {
+		for _, bl := range blocks {
+			if m := reCwd.FindStringSubmatch(bl.Text); m != nil {
+				return strings.TrimSpace(m[1])
+			}
+		}
 	}
 	return ""
 }
