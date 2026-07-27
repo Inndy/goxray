@@ -193,6 +193,11 @@ type responseView struct {
 	Events      []wire.SSEEvent `json:"events,omitempty"`
 	JSON        json.RawMessage `json:"json,omitempty"`
 	Text        string          `json:"text,omitempty"`
+	// Message is the reply reassembled into the same shape as a request
+	// message, so the timeline can show what the model actually did this turn.
+	// Without it a turn's own output appears nowhere until the next request
+	// quotes it back — and the newest turn never gets one.
+	Message *wire.AssembledMessage `json:"message,omitempty"`
 }
 
 func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
@@ -258,8 +263,10 @@ func buildResponseView(ex *model.Exchange, body []byte) *responseView {
 	switch {
 	case strings.Contains(ct, "text/event-stream"):
 		rv.Events = wire.ParseSSEEvents(body)
+		rv.Message = wire.AssembleSSE(rv.Events)
 	case json.Valid(body):
 		rv.JSON = body
+		rv.Message = wire.AssembleJSON(body)
 	default:
 		rv.Text = string(body)
 	}

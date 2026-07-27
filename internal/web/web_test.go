@@ -212,6 +212,60 @@ func TestExchangeDetail(t *testing.T) {
 	}
 }
 
+// A turn's own reply is not in its request, so without the assembled message
+// the newest turn's output would be visible nowhere but the raw bytes.
+func TestExchangeDetailAssemblesTheReply(t *testing.T) {
+	rd := newTestReader()
+	rd.blobs["r2"] = []byte(
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n" +
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+
+	var d detail
+	w := do(t, Handler(rd, NewHub(), testPort), "GET", "/api/exchange/ex1", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Response == nil || d.Response.Message == nil {
+		t.Fatalf("no assembled message: %+v", d.Response)
+	}
+	m := d.Response.Message
+	if m.Role != "assistant" || m.StopReason != "end_turn" || m.Truncated {
+		t.Errorf("message header = %+v", m)
+	}
+	if len(m.Content) != 1 {
+		t.Fatalf("want 1 content block, got %d", len(m.Content))
+	}
+	var b struct {
+		Type, Text string
+	}
+	if err := json.Unmarshal(m.Content[0], &b); err != nil {
+		t.Fatal(err)
+	}
+	if b.Type != "text" || b.Text != "hello" {
+		t.Errorf("block = %+v", b)
+	}
+}
+
+func TestExchangeDetailAssemblesNonStreamingReply(t *testing.T) {
+	rd := newTestReader()
+	rd.rows[0].ResHeaders = map[string]string{"content-type": "application/json"}
+	rd.blobs["r2"] = []byte(`{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}`)
+
+	var d detail
+	w := do(t, Handler(rd, NewHub(), testPort), "GET", "/api/exchange/ex1", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Response == nil || d.Response.Message == nil {
+		t.Fatalf("no assembled message: %+v", d.Response)
+	}
+	if len(d.Response.Message.Content) != 1 {
+		t.Errorf("content = %s", d.Response.Message.Content)
+	}
+}
+
 func TestExchangeNotFound(t *testing.T) {
 	h := Handler(newTestReader(), NewHub(), testPort)
 	if w := do(t, h, "GET", "/api/exchange/nope", nil); w.Code != http.StatusNotFound {
