@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,6 +13,15 @@ import (
 	"go.inndy.tw/goxray/internal/pricing"
 	"go.inndy.tw/goxray/internal/wire"
 )
+
+// Observer is notified after each durability barrier commits. It exists for
+// live read-side consumers (the dashboard); implementations MUST NOT block and
+// MUST NOT panic — they run on the request goroutine, and the fail-closed
+// guarantee has already been satisfied by the time they are called, so an
+// observer can neither strengthen nor weaken it.
+type Observer interface {
+	OnExchange(ex model.Exchange)
+}
 
 // Recorder orchestrates the fail-closed commit sequence. The two Persist calls
 // are the durability barriers: PersistRequest before forwarding, PersistResponse
@@ -23,8 +33,33 @@ type Recorder struct {
 	parser    wire.WireParser
 	provider  model.Provider
 
+	obs  atomic.Pointer[Observer]
 	jobs chan model.Exchange
 	wg   sync.WaitGroup
+}
+
+// SetObserver installs (or with nil, clears) the live observer. Safe to call at
+// any time; the read on the hot path is a single atomic load.
+func (r *Recorder) SetObserver(o Observer) {
+	if o == nil {
+		r.obs.Store(nil)
+		return
+	}
+	r.obs.Store(&o)
+}
+
+// notify fires the observer, isolating the hot path from a misbehaving one.
+func (r *Recorder) notify(ex *model.Exchange) {
+	p := r.obs.Load()
+	if p == nil {
+		return
+	}
+	defer func() {
+		if v := recover(); v != nil {
+			logf("observer panic on %s: %v", ex.ID, v)
+		}
+	}()
+	(*p).OnExchange(*ex)
 }
 
 // NewRecorder wires the durable stores together and starts the async index
@@ -85,7 +120,11 @@ func (r *Recorder) PersistRequest(ex *model.Exchange, rawReq []byte) error {
 		return err
 	}
 	ex.ReqRef = ref
-	return r.manifests.Write(ex)
+	if err := r.manifests.Write(ex); err != nil {
+		return err
+	}
+	r.notify(ex)
+	return nil
 }
 
 // PersistResponse parses response metadata, stores the raw response blob, and
@@ -118,6 +157,7 @@ func (r *Recorder) PersistResponse(ex *model.Exchange, rawRes []byte) error {
 		return err
 	}
 	r.enqueueIndex(*ex)
+	r.notify(ex)
 	return nil
 }
 

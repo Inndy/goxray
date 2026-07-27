@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver, registered as "sqlite"
@@ -39,12 +41,54 @@ INSERT OR REPLACE INTO entries(
   cost,status,stop_reason,cwd,is_subagent,title,elapsed_ms,ratelimit,req_ref,res_ref,parse_ok)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
-// Filter narrows a Query.
+// Filter narrows a Query. Since is a UnixMilli lower bound (exclusive), used by
+// the dashboard to fetch only what appeared after its last poll.
 type Filter struct {
 	Session      string
 	Source       string
 	Limit        int
+	Offset       int
+	Since        int64
 	IncludeNoise bool
+}
+
+// where builds the shared WHERE clause for entry and session queries.
+func (f Filter) where() (string, []any) {
+	var args []any
+	var parts []string
+	if f.Session != "" {
+		parts = append(parts, "session = ?")
+		args = append(args, f.Session)
+	}
+	if f.Source != "" {
+		parts = append(parts, "source = ?")
+		args = append(args, f.Source)
+	}
+	if f.Since > 0 {
+		parts = append(parts, "ts > ?")
+		args = append(args, f.Since)
+	}
+	if !f.IncludeNoise {
+		parts = append(parts, "is_noise = 0")
+	}
+	if len(parts) == 0 {
+		return "", nil
+	}
+	return " WHERE " + strings.Join(parts, " AND "), args
+}
+
+// limitOffset appends LIMIT/OFFSET. SQLite requires a LIMIT before OFFSET, so a
+// bare offset uses the "unlimited" sentinel -1.
+func (f Filter) limitOffset() (string, []any) {
+	switch {
+	case f.Limit > 0 && f.Offset > 0:
+		return " LIMIT ? OFFSET ?", []any{f.Limit, f.Offset}
+	case f.Limit > 0:
+		return " LIMIT ?", []any{f.Limit}
+	case f.Offset > 0:
+		return " LIMIT -1 OFFSET ?", []any{f.Offset}
+	}
+	return "", nil
 }
 
 type writeReq struct {
@@ -139,37 +183,23 @@ func (i *Index) Query(f Filter) ([]model.Exchange, error) {
 	return queryEntries(i.db, f)
 }
 
+// Sessions returns per-session rollups, most recently active first.
+func (i *Index) Sessions(f Filter) ([]Session, error) {
+	return querySessions(i.db, f)
+}
+
+// entryCols mirrors upsertSQL's column order so a row round-trips through the
+// projection without losing any field the dashboard needs (the earlier list
+// dropped cache_read/cache_create, which the context bar depends on).
+const entryCols = `id,ts,capture_ver,state,provider,source,session,is_noise,method,url,request_id,
+  model,msg_count,tool_count,input_tokens,output_tokens,cache_read,cache_create,
+  cost,status,stop_reason,cwd,is_subagent,title,elapsed_ms,ratelimit,req_ref,res_ref,parse_ok`
+
 func queryEntries(db *sql.DB, f Filter) ([]model.Exchange, error) {
-	q := `SELECT id,ts,state,provider,source,session,is_noise,method,url,request_id,model,
-	       msg_count,input_tokens,output_tokens,cost,status,stop_reason,title,elapsed_ms,req_ref,res_ref
-	       FROM entries`
-	var args []any
-	var where []string
-	if f.Session != "" {
-		where = append(where, "session = ?")
-		args = append(args, f.Session)
-	}
-	if f.Source != "" {
-		where = append(where, "source = ?")
-		args = append(args, f.Source)
-	}
-	if !f.IncludeNoise {
-		where = append(where, "is_noise = 0")
-	}
-	for n, w := range where {
-		if n == 0 {
-			q += " WHERE "
-		} else {
-			q += " AND "
-		}
-		q += w
-	}
-	q += " ORDER BY ts DESC"
-	if f.Limit > 0 {
-		q += " LIMIT ?"
-		args = append(args, f.Limit)
-	}
-	rows, err := db.Query(q, args...)
+	where, args := f.where()
+	tail, tailArgs := f.limitOffset()
+	q := `SELECT ` + entryCols + ` FROM entries` + where + ` ORDER BY ts DESC` + tail
+	rows, err := db.Query(q, append(args, tailArgs...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -177,25 +207,116 @@ func queryEntries(db *sql.DB, f Filter) ([]model.Exchange, error) {
 
 	var out []model.Exchange
 	for rows.Next() {
-		var e model.Exchange
-		var ts, elapsed int64
-		var isNoise int
-		var reqID string
-		if err := rows.Scan(&e.ID, &ts, &e.State, &e.Provider, &e.Source, &e.Req.SessionID, &isNoise,
-			&e.Method, &e.URL, &reqID, &e.Req.Model, &e.Req.MsgCount,
-			&e.Res.Usage.InputTokens, &e.Res.Usage.OutputTokens, &e.Res.Cost, &e.Status,
-			&e.Res.StopReason, &e.Res.Title, &elapsed, &e.ReqRef, &e.ResRef); err != nil {
+		e, err := scanEntry(rows)
+		if err != nil {
 			return nil, err
 		}
-		e.IsNoise = isNoise != 0
-		e.StartedAt = time.UnixMilli(ts).UTC()
-		if elapsed > 0 {
-			e.EndedAt = e.StartedAt.Add(time.Duration(elapsed) * time.Millisecond)
-		}
-		if reqID != "" {
-			e.ResHeaders = map[string]string{"request-id": reqID}
-		}
 		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func scanEntry(rows *sql.Rows) (model.Exchange, error) {
+	var e model.Exchange
+	var ts, elapsed int64
+	var isNoise, isSubagent, parseOK int
+	var reqID, ratelimit string
+	if err := rows.Scan(
+		&e.ID, &ts, &e.CaptureVer, &e.State, &e.Provider, &e.Source, &e.Req.SessionID, &isNoise,
+		&e.Method, &e.URL, &reqID,
+		&e.Req.Model, &e.Req.MsgCount, &e.Req.ToolCount,
+		&e.Res.Usage.InputTokens, &e.Res.Usage.OutputTokens,
+		&e.Res.Usage.CacheReadTokens, &e.Res.Usage.CacheCreateTokens,
+		&e.Res.Cost, &e.Status, &e.Res.StopReason, &e.Req.Cwd, &isSubagent,
+		&e.Res.Title, &elapsed, &ratelimit, &e.ReqRef, &e.ResRef, &parseOK,
+	); err != nil {
+		return e, err
+	}
+	e.IsNoise = isNoise != 0
+	e.Req.IsSubagent = isSubagent != 0
+	e.ParseOK = parseOK != 0
+	e.StartedAt = time.UnixMilli(ts).UTC()
+	if elapsed > 0 {
+		e.EndedAt = e.StartedAt.Add(time.Duration(elapsed) * time.Millisecond)
+	}
+	// Reassemble the curated response headers the projection flattened.
+	h := map[string]string{}
+	if reqID != "" {
+		h["request-id"] = reqID
+	}
+	if ratelimit != "" {
+		var rl map[string]string
+		if json.Unmarshal([]byte(ratelimit), &rl) == nil {
+			maps.Copy(h, rl)
+		}
+	}
+	if len(h) > 0 {
+		e.ResHeaders = h
+	}
+	return e, nil
+}
+
+// Session is a per-session rollup. Derived live from a GROUP BY rather than a
+// maintained side file — the index is already the projection, so there is no
+// second thing to keep in sync or reconcile.
+type Session struct {
+	SessionID    string   `json:"session_id"`
+	Cwd          string   `json:"cwd"`
+	Model        string   `json:"model"`
+	Title        string   `json:"title"`
+	Turns        int      `json:"turns"`
+	Subagents    int      `json:"subagents"`
+	Cost         float64  `json:"cost"`
+	InputTokens  int      `json:"input_tokens"`
+	OutputTokens int      `json:"output_tokens"`
+	CacheRead    int      `json:"cache_read"`
+	CacheCreate  int      `json:"cache_create"`
+	FirstTS      int64    `json:"first_ts"`
+	LastTS       int64    `json:"last_ts"`
+	Sources      []string `json:"sources"`
+}
+
+// querySessions rolls entries up by session. Model/cwd/title come from
+// correlated subqueries picking the most recent non-empty value, because a bare
+// column alongside two aggregates (MIN and MAX) is not guaranteed by SQLite to
+// come from any particular row.
+func querySessions(db *sql.DB, f Filter) ([]Session, error) {
+	where, args := f.where()
+	tail, tailArgs := f.limitOffset()
+	q := `SELECT session,
+	    COUNT(*), COALESCE(SUM(is_subagent),0), COALESCE(SUM(cost),0),
+	    COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+	    COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_create),0),
+	    MIN(ts), MAX(ts),
+	    COALESCE(GROUP_CONCAT(DISTINCT source),''),
+	    COALESCE((SELECT t.model FROM entries t WHERE t.session=e.session AND t.model!='' ORDER BY t.ts DESC LIMIT 1),''),
+	    COALESCE((SELECT t.cwd   FROM entries t WHERE t.session=e.session AND t.cwd  !='' ORDER BY t.ts DESC LIMIT 1),''),
+	    COALESCE((SELECT t.title FROM entries t WHERE t.session=e.session AND t.title!='' ORDER BY t.ts DESC LIMIT 1),'')
+	  FROM entries e` + where + ` GROUP BY session ORDER BY MAX(ts) DESC` + tail
+	rows, err := db.Query(q, append(args, tailArgs...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []Session{}
+	for rows.Next() {
+		var s Session
+		var sources string
+		if err := rows.Scan(&s.SessionID, &s.Turns, &s.Subagents, &s.Cost,
+			&s.InputTokens, &s.OutputTokens, &s.CacheRead, &s.CacheCreate,
+			&s.FirstTS, &s.LastTS, &sources, &s.Model, &s.Cwd, &s.Title); err != nil {
+			return nil, err
+		}
+		// Always an array, never null: a nil slice would marshal to JSON null and
+		// break every client that treats this as a list.
+		s.Sources = []string{}
+		for src := range strings.SplitSeq(sources, ",") {
+			if src != "" {
+				s.Sources = append(s.Sources, src)
+			}
+		}
+		out = append(out, s)
 	}
 	return out, rows.Err()
 }

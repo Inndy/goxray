@@ -49,6 +49,14 @@ func (r *Reader) List(f Filter) ([]model.Exchange, error) {
 	return queryEntries(r.db, f)
 }
 
+// Sessions returns per-session rollups. Empty when no index exists yet.
+func (r *Reader) Sessions(f Filter) ([]Session, error) {
+	if r.db == nil {
+		return nil, nil
+	}
+	return querySessions(r.db, f)
+}
+
 // Manifest reads one exchange's full audit record.
 func (r *Reader) Manifest(id string) (*model.Exchange, error) {
 	return r.manifests.Read(id)
