@@ -56,6 +56,27 @@ func Known(modelID string) bool {
 	return ok
 }
 
+// Price returns the USD cost of a parsed response. It prefers the model id the
+// API reported over the alias the request asked for, and scales by service tier.
+// This is what callers should use; Calc is the bare arithmetic.
+func Price(res model.ResMeta, reqModel string) float64 {
+	id := res.Model
+	if id == "" {
+		id = reqModel
+	}
+	return Calc(res.Usage, id) * tierMultiplier(res.ServiceTier)
+}
+
+// tierMultiplier scales the rate by how the request was served. Batch is half
+// price. Priority is negotiated per-account, so it stays at 1 rather than
+// inventing a premium nobody has verified.
+func tierMultiplier(tier string) float64 {
+	if tier == "batch" {
+		return 0.5
+	}
+	return 1
+}
+
 // Calc returns the USD cost of a usage record for the given model. Returns 0
 // for an unknown model (never guesses a price it can't justify).
 func Calc(u model.Usage, modelID string) float64 {
@@ -64,14 +85,24 @@ func Calc(u model.Usage, modelID string) float64 {
 		return 0
 	}
 	const perM = 1_000_000.0
-	// Usage carries one flat cache-creation figure, so the 5m rate is applied.
-	// Claude Code does request 1h TTLs, which this therefore underprices; billing
-	// the two apart needs usage.cache_creation.{ephemeral_5m,ephemeral_1h} to be
-	// captured first.
 	return float64(u.InputTokens)/perM*r.input +
 		float64(u.OutputTokens)/perM*r.output +
 		float64(u.CacheReadTokens)/perM*r.cacheRead +
-		float64(u.CacheCreateTokens)/perM*r.cacheWrite5m
+		cacheWriteCost(u, r)
+}
+
+// cacheWriteCost bills the TTL split when the capture has it and falls back to
+// the flat total at the 5m rate when it does not. The fallback underprices 1h
+// writes by 60%, which is why `goxray migrate-usage` exists — it backfills the
+// split from the recorded blobs. Keyed on which fields are populated rather
+// than on a capture version, so a partial capture still prices correctly.
+func cacheWriteCost(u model.Usage, r rate) float64 {
+	const perM = 1_000_000.0
+	if u.CacheCreate5m > 0 || u.CacheCreate1h > 0 {
+		return float64(u.CacheCreate5m)/perM*r.cacheWrite5m +
+			float64(u.CacheCreate1h)/perM*r.cacheWrite1h
+	}
+	return float64(u.CacheCreateTokens) / perM * r.cacheWrite5m
 }
 
 func lookup(modelID string) (rate, bool) {
