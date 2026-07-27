@@ -74,16 +74,25 @@ const ctxKey = (sid, model) => `${sid}|${model || ''}`
 
 export const ctxWindowFor = (sid, model) => state.ctxWindowByModel[ctxKey(sid, model)] || 0
 
+// Generation counters guard both list loads the same way selectExchange guards
+// the detail fetch: rapid session/noise switching can leave an older request in
+// flight, and its late response must not overwrite the newer state.
+let sessionsGen = 0
+let exchangesGen = 0
+
 export async function loadSessions() {
+  const gen = ++sessionsGen
   try {
     const { sessions } = await fetchSessions({ noise: state.showNoise ? 1 : '' })
+    if (gen !== sessionsGen) return
     state.sessions = sessions || []
   } catch (e) {
-    state.error = e.message
+    if (gen === sessionsGen) state.error = e.message
   }
 }
 
 export async function loadExchanges() {
+  const gen = ++exchangesGen
   state.loadingList = true
   try {
     const { exchanges } = await fetchExchanges({
@@ -91,12 +100,13 @@ export async function loadExchanges() {
       noise: state.showNoise ? 1 : '',
       limit: 500,
     })
+    if (gen !== exchangesGen) return
     state.exchanges = exchanges || []
     state.error = ''
   } catch (e) {
-    state.error = e.message
+    if (gen === exchangesGen) state.error = e.message
   } finally {
-    state.loadingList = false
+    if (gen === exchangesGen) state.loadingList = false
   }
 }
 
