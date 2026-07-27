@@ -157,6 +157,18 @@ func (r *Recorder) PersistResponse(ex *model.Exchange, rawRes []byte) error {
 
 	ref, err := r.blobs.Put(rawRes)
 	if err != nil {
+		// The blob store failed but the manifests may still be writable: record
+		// the terminal persist_failed state rather than leaving the inflight
+		// manifest to masquerade as a crash. Parsed metadata (usage, model) is
+		// kept — it was extracted before the blob was lost. Best-effort: if this
+		// write fails too, the manifest simply stays inflight.
+		ex.State = model.StatePersistFailed
+		if werr := r.manifests.Write(ex); werr != nil {
+			logf("persist_failed manifest %s: %v", ex.ID, werr)
+		} else {
+			r.enqueueIndex(*ex)
+			r.notify(ex)
+		}
 		return err
 	}
 	ex.ResRef = ref

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"net/http"
 	"path/filepath"
 	"testing"
@@ -163,6 +164,59 @@ func TestDegradedIndexStaysUncleanUntilRecoverySucceeds(t *testing.T) {
 		t.Errorf("healthy close should mark clean (wasClean=%v, err=%v)", wasClean, err)
 	}
 	idx.Close()
+}
+
+type flakyBlobs struct {
+	BlobStore
+	failAfter int
+	n         int
+}
+
+func (f *flakyBlobs) Put(b []byte) (string, error) {
+	f.n++
+	if f.n > f.failAfter {
+		return "", errors.New("disk full")
+	}
+	return f.BlobStore.Put(b)
+}
+
+// When the response blob write fails, the manifests may still be writable: the
+// record must land as terminal persist_failed, not stay inflight forever and
+// masquerade as a crash-interrupted turn.
+func TestBlobFailureRecordsPersistFailed(t *testing.T) {
+	d := t.TempDir()
+	blobs, err := newLocalBlobs(filepath.Join(d, "blobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifests := newLocalManifests(filepath.Join(d, "manifests"))
+	idx, _, _, err := OpenIndex(filepath.Join(d, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := NewRecorder(&flakyBlobs{BlobStore: blobs, failAfter: 1}, manifests, idx, model.ProviderAnthropic, 1)
+
+	ex := rec.NewExchange("POST", "/v1/messages", nil)
+	if err := rec.PersistRequest(ex, []byte(`{"model":"x"}`)); err != nil {
+		t.Fatal(err)
+	}
+	ex.State = model.StateComplete
+	if err := rec.PersistResponse(ex, []byte(smallSSE)); err == nil {
+		t.Fatal("PersistResponse should fail when the blob store fails")
+	}
+	rec.Close()
+	idx.Close()
+
+	got, err := manifests.Read(ex.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.StatePersistFailed {
+		t.Errorf("manifest state = %q, want persist_failed", got.State)
+	}
+	if got.ResRef != "" {
+		t.Errorf("res_ref = %q, want empty (blob was never stored)", got.ResRef)
+	}
 }
 
 // A handler that outlives the shutdown deadline can reach a closed store; the
