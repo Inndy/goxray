@@ -16,9 +16,15 @@ const state = reactive({
   error: '',
   // Context window is only derivable from a request body (Claude Code often
   // omits the [1m] marker from the model field and names it in the system
-  // prompt), so it is learned from loaded details and cached per session. Rows
-  // show a percentage only once it is known, rather than assuming 200K.
-  ctxWindowBySession: {},
+  // prompt), so it is learned from loaded details. Rows show a percentage only
+  // once it is known, rather than assuming 200K.
+  //
+  // Keyed by session *and* model, because one session routinely mixes windows:
+  // a 1M Opus turn beside a 200K Haiku side-turn. Caching a single window per
+  // session let whichever turn was opened last set the denominator for every
+  // other model's rows, which rendered a 1M turn as several hundred percent of
+  // a 200K window.
+  ctxWindowByModel: {},
 })
 
 const byStartedDesc = (a, b) => startedMs(b) - startedMs(a)
@@ -64,7 +70,9 @@ export const gaps = computed(() => {
   return out
 })
 
-export const ctxWindowFor = (sid) => state.ctxWindowBySession[sid] || 0
+const ctxKey = (sid, model) => `${sid}|${model || ''}`
+
+export const ctxWindowFor = (sid, model) => state.ctxWindowByModel[ctxKey(sid, model)] || 0
 
 export async function loadSessions() {
   try {
@@ -113,8 +121,8 @@ export async function selectExchange(id) {
     // Guard against a slower earlier request landing after a newer selection.
     if (state.selectedId !== id) return
     state.detail = d
-    const sid = d.exchange?.req?.session_id || ''
-    if (d.ctx_window) state.ctxWindowBySession[sid] = d.ctx_window
+    const req = d.exchange?.req || {}
+    if (d.ctx_window) state.ctxWindowByModel[ctxKey(req.session_id || '', req.model)] = d.ctx_window
     state.error = ''
   } catch (e) {
     state.error = e.message

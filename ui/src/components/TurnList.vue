@@ -82,7 +82,7 @@ const sid = (ex) => ex.req?.session_id || ''
 
         <div v-if="title(ex)" class="line2">{{ title(ex) }}</div>
 
-        <CacheBar :usage="ex.res?.usage" :ctx-window="ctxWindowFor(sid(ex))" />
+        <CacheBar :usage="ex.res?.usage" :ctx-window="ctxWindowFor(sid(ex), ex.req?.model)" />
 
         <div class="line4">
           <span v-if="fmtDuration(elapsedMs(ex))" class="mono">{{
