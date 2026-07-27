@@ -1,0 +1,78 @@
+package store
+
+import (
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"go.inndy.tw/goxray/internal/model"
+)
+
+// ManifestStore persists the immutable per-exchange audit record. A manifest is
+// written twice in the happy path — once inflight (before forwarding), once
+// final (at commit) — each via temp-file + rename + dir fsync, so a crash never
+// leaves torn JSON. The final write atomically supersedes the inflight one.
+type ManifestStore interface {
+	Write(ex *model.Exchange) error
+	Read(id string) (*model.Exchange, error)
+	// EachID invokes fn for every manifest id (filename scan, no parse). Used by
+	// index rebuild and startup reconcile.
+	EachID(fn func(id string) error) error
+}
+
+type localManifests struct {
+	dir string
+}
+
+func newLocalManifests(dir string) *localManifests {
+	return &localManifests{dir: dir}
+}
+
+func (m *localManifests) path(id string) string {
+	return shardPath(m.dir, id, ".json")
+}
+
+func (m *localManifests) Write(ex *model.Exchange) error {
+	data, err := json.Marshal(ex)
+	if err != nil {
+		return err
+	}
+	return writeFileSync(m.path(ex.ID), data)
+}
+
+func (m *localManifests) Read(id string) (*model.Exchange, error) {
+	data, err := readFile(m.path(id))
+	if err != nil {
+		return nil, err
+	}
+	var ex model.Exchange
+	if err := json.Unmarshal(data, &ex); err != nil {
+		return nil, err
+	}
+	return &ex, nil
+}
+
+// EachID walks the sharded manifest tree yielding ids. Unreadable shard dirs are
+// skipped (best-effort); a callback error stops the walk.
+func (m *localManifests) EachID(fn func(id string) error) error {
+	err := filepath.WalkDir(m.dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return nil // skip unreadable entries rather than abort the whole scan
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+		id := strings.TrimSuffix(d.Name(), ".json")
+		return fn(id)
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
