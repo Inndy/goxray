@@ -144,7 +144,7 @@ func (r *Recorder) PersistResponse(ex *model.Exchange, rawRes []byte) error {
 		ct = ex.ResHeaders["content-type"]
 	}
 	meta, ok := r.parser.ParseResponse(nil, rawRes, ct)
-	meta.Cost = pricing.Calc(meta.Usage, ex.Req.Model)
+	meta.Cost = pricing.Price(meta, ex.Req.Model)
 	ex.Res = meta
 	ex.ParseOK = ok
 

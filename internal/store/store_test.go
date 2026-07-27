@@ -129,6 +129,45 @@ func TestRecorderFlow(t *testing.T) {
 	}
 }
 
+// A cost stamped at record time goes stale as soon as the rate table moves, so
+// reads must recompute it rather than trust what is on disk.
+func TestManifestReadRepricesStoredCost(t *testing.T) {
+	man := newLocalManifests(filepath.Join(t.TempDir(), "manifests"))
+
+	ex := &model.Exchange{
+		ID: "00000000-0000-7000-8000-00000000dd01", State: model.StateComplete,
+		Req: model.ReqMeta{Model: "claude-opus-5"},
+		Res: model.ResMeta{
+			Usage: model.Usage{InputTokens: 1_000_000, OutputTokens: 1_000_000},
+			Cost:  0, // as if the model had no price on file when it was recorded
+		},
+	}
+	if err := man.Write(ex); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := man.Read(ex.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 30.0; got.Res.Cost != want {
+		t.Errorf("cost = %v, want %v recomputed from tokens", got.Res.Cost, want)
+	}
+
+	// A wrong figure already on disk must lose to the derived one, not win.
+	ex.Res.Cost = 999
+	if err := man.Write(ex); err != nil {
+		t.Fatal(err)
+	}
+	got, err = man.Read(ex.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Res.Cost != 30.0 {
+		t.Errorf("stale stored cost survived read: %v", got.Res.Cost)
+	}
+}
+
 func TestRebuildFromManifests(t *testing.T) {
 	d := t.TempDir()
 	blobsDir := filepath.Join(d, "blobs")

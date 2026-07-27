@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"go.inndy.tw/goxray/internal/model"
+	"go.inndy.tw/goxray/internal/pricing"
 )
 
 // ManifestStore persists the immutable per-exchange audit record. A manifest is
@@ -43,6 +44,12 @@ func (m *localManifests) Write(ex *model.Exchange) error {
 	return writeFileSync(m.path(ex.ID), data)
 }
 
+// Read returns the manifest with its cost recomputed from the stored token
+// counts. The persisted figure is only what the rate table said at record time,
+// and that table moves — a model can be unpriced when captured and priced later.
+// Repricing here rather than at each call site means the index rebuild, the
+// dashboard and the CLI cannot disagree, and a rate change needs no rewrite of
+// the audit records: delete index.db and restart.
 func (m *localManifests) Read(id string) (*model.Exchange, error) {
 	data, err := readFile(m.path(id))
 	if err != nil {
@@ -52,6 +59,7 @@ func (m *localManifests) Read(id string) (*model.Exchange, error) {
 	if err := json.Unmarshal(data, &ex); err != nil {
 		return nil, err
 	}
+	ex.Res.Cost = pricing.Price(ex.Res, ex.Req.Model)
 	return &ex, nil
 }
 
