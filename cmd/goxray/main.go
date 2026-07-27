@@ -99,13 +99,19 @@ func serve(args []string) error {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
+	// Proxy first, with the whole deadline: its handlers are mid-commit and
+	// deserve every second. The dashboard is hard-closed — its SSE streams never
+	// go idle, so a graceful Shutdown would just burn the deadline waiting on
+	// them (and previously starved the proxy of it).
 	shutdown := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if uiSrv != nil {
-			_ = uiSrv.Shutdown(ctx)
+		if err := httpSrv.Shutdown(ctx); err != nil {
+			log.Printf("goxray: proxy shutdown: %v (a stream may still be mid-turn)", err)
 		}
-		_ = httpSrv.Shutdown(ctx)
+		if uiSrv != nil {
+			_ = uiSrv.Close()
+		}
 	}
 
 	select {
