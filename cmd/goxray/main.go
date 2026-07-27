@@ -23,6 +23,7 @@ import (
 	"go.inndy.tw/goxray/internal/model"
 	"go.inndy.tw/goxray/internal/proxy"
 	"go.inndy.tw/goxray/internal/store"
+	"go.inndy.tw/goxray/internal/web"
 )
 
 func main() {
@@ -74,18 +75,49 @@ func serve(args []string) error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpSrv.ListenAndServe() }()
 
+	// The dashboard is a separate server on a separate port with read-only
+	// access to the store. It observes the recorder to stream live turns; the
+	// observer is non-blocking, so it cannot stall the fail-closed path.
+	var uiSrv *http.Server
+	if cfg.UIEnabled() {
+		hub := web.NewHub()
+		st.Recorder.SetObserver(hub)
+		addr := fmt.Sprintf("127.0.0.1:%d", cfg.UIPort)
+		uiSrv = &http.Server{
+			Addr:    addr,
+			Handler: web.Handler(web.FromStore(st), hub, cfg.UIPort),
+		}
+		log.Printf("dashboard: http://localhost:%d", cfg.UIPort)
+		go func() {
+			if err := uiSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				// A dead dashboard must not take the proxy down with it.
+				log.Printf("goxray: dashboard: %v", err)
+			}
+		}()
+	}
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
+	shutdown := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if uiSrv != nil {
+			_ = uiSrv.Shutdown(ctx)
+		}
+		_ = httpSrv.Shutdown(ctx)
+	}
+
 	select {
 	case err := <-errCh:
+		if uiSrv != nil {
+			_ = uiSrv.Close()
+		}
 		st.Close()
 		return err
 	case <-sig:
 		log.Printf("shutting down…")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = httpSrv.Shutdown(ctx)
+		shutdown()
 		if err := st.Close(); err != nil {
 			log.Printf("goxray: store close: %v", err)
 		}
@@ -103,6 +135,7 @@ func printUsage() {
 
 flags:
   --port N            listen port (env PROXY_PORT, default 5599)
+  --ui-port N         dashboard port (env GOXRAY_UI_PORT, default 0 = off)
   --home DIR          data dir (env GOXRAY_HOME, default ~/.goxray)
   --max-body-mb N     max request body MiB (default 50)
   --upstream URL      override upstream (env GOXRAY_UPSTREAM)

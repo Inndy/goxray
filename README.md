@@ -24,10 +24,15 @@ Three ccxray (Node.js) weaknesses this fixes:
 ## Usage
 
 ```bash
+make build          # builds the dashboard bundle, then the binary
+# or, without a Node toolchain (the bundle is committed):
 go build -o goxray ./cmd/goxray
 
 # run the proxy (default command)
 ./goxray --port 5599
+
+# ...with the read-only dashboard on a second port
+./goxray --port 5599 --ui-port 5600      # → http://localhost:5600
 
 # point Claude Code at it
 export ANTHROPIC_BASE_URL=http://localhost:5599
@@ -41,9 +46,47 @@ claude
 ./goxray raw  <id> [req|res]    # verbatim recorded bytes
 ```
 
-Config (flags or env): `--port`/`PROXY_PORT` (default 5599), `GOXRAY_HOME`
+Config (flags or env): `--port`/`PROXY_PORT` (default 5599),
+`--ui-port`/`GOXRAY_UI_PORT` (default 0 = dashboard off), `GOXRAY_HOME`
 (default `~/.goxray`), `--max-body-mb` (default 50), `--upstream`/`GOXRAY_UPSTREAM`.
 Binds `127.0.0.1` only. `GET /healthz` for liveness.
+
+## Dashboard
+
+`--ui-port N` starts a second, read-only HTTP server beside the proxy. Sessions →
+turns → detail, with new turns streaming in live over SSE.
+
+Per turn: the **recording state** (`complete` / `inflight` / `client_aborted` /
+`upstream_error` / `persist_failed` / `timeout`), the cache/input composition of
+its context, the idle gap since the previous turn (the cheapest cache-miss
+diagnosis there is), and four detail tabs:
+
+| Tab | Shows |
+|---|---|
+| **Timeline** | `messages[]` flattened into steps — each `tool_use` joined to its `tool_result`, parallel calls grouped, thinking attached, injected context separated from text a human actually typed, `role:"system"` messages surfaced |
+| **System** | the system prompt split into named sections, each tagged `anthropic` (shipped by Claude Code) or `user` (contributed by your machine and config) |
+| **Tools** | core and MCP definitions with per-turn call counts, and what share of context they cost |
+| **Raw** | headers, request options, SSE events, and links to the verbatim recorded bytes |
+
+Everything the dashboard shows besides the raw bytes is *derived*: token counts
+are a ~4-chars-per-token estimate that runs below the API's real figure, and the
+system-prompt split is a heuristic over prose Anthropic can reshape. The verbatim
+blob is always one click away.
+
+**It is off by default and must stay on loopback.** The store holds every
+conversation in full, so the dashboard is opt-in per run and its handlers reach
+the store through a read-only interface that cannot write blobs, manifests, or
+the index. Requests are rejected unless the `Host` header is loopback on the
+dashboard's own port — that check, not the loopback bind, is what defeats DNS
+rebinding, since a rebound request still carries the attacker's domain in `Host`.
+`Origin` must also be loopback, no CORS headers are ever sent, and recorded
+bodies are served as `text/plain` unless they are JSON or SSE so they can never
+be interpreted as markup. None of this is authentication: exposing the port off
+loopback would need real auth first.
+
+Frontend development: `make ui-dev` runs vite on :5173 proxying `/api` to :5600.
+`make ui` writes the production bundle into `internal/web/dist`, which is
+committed and embedded.
 
 ## How it records (fail-closed)
 
@@ -112,14 +155,22 @@ audit-grade (see below).
 | Package | Role |
 |---|---|
 | `internal/proxy` | HTTP server, `Classify` routing, `httpTransport` (SSE tee + hold-back) |
-| `internal/store` | `BlobStore` (zstd), `ManifestStore`, `Index` (SQLite), `Recorder` |
-| `internal/wire` | `WireParser` + Anthropic impl (usage/session/cwd/stop/title) |
+| `internal/store` | `BlobStore` (zstd), `ManifestStore`, `Index` (SQLite), `Recorder`, `Observer` |
+| `internal/wire` | `WireParser` + Anthropic impl (usage/session/cwd/stop/title), SSE frame splitter |
+| `internal/view` | read-only derivations: system-prompt sections, token estimates, tool summary |
+| `internal/web` | dashboard JSON API + embedded SPA, behind a read-only `Reader` interface |
 | `internal/pricing` | token → USD cost (fallback table) |
 | `internal/model` | `Exchange`, `ReqMeta`, `ResMeta` |
+| `ui/` | Vue 3 + naive-ui frontend; builds into `internal/web/dist` |
+
+The dashboard observes the recorder through `store.Observer`, which fires only
+after a durability barrier has already committed and is non-blocking with
+drop-on-full — so a stalled or absent browser can never hold up the proxy.
 
 Deferred but seamed for: OpenAI HTTP (new `WireParser` + `Classify` rule), Codex
 WebSocket (new `Transport` emitting the same `Exchange`), content-addressed dedup
-(new `BlobStore` backend, opaque ref unchanged), dashboard, hub, intercept.
+(new `BlobStore` backend, opaque ref unchanged), hub, intercept. A `goxray ui`
+subcommand is nearly free: `*store.Reader` already satisfies `web.Reader`.
 
 ## Tests
 
