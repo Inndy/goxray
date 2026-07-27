@@ -46,6 +46,17 @@ type Usage struct {
 	OutputTokens      int `json:"output_tokens"`
 	CacheReadTokens   int `json:"cache_read_input_tokens"`
 	CacheCreateTokens int `json:"cache_creation_input_tokens"`
+	// Cache writes bill per TTL — 1.25x input for 5m, 2x for 1h — so the flat
+	// total above cannot be priced correctly on its own. Both are zero on
+	// captures taken before this was plumbed through; pricing then falls back to
+	// the flat field at the 5m rate. Run `goxray migrate-usage` to fill them in
+	// from the recorded response blobs.
+	CacheCreate5m int `json:"cache_creation_5m,omitempty"`
+	CacheCreate1h int `json:"cache_creation_1h,omitempty"`
+	// ThinkingTokens is a subset of OutputTokens, reported separately. Not
+	// billed on its own; kept because it is the only signal of how much of a
+	// turn's output spend went to reasoning.
+	ThinkingTokens int `json:"thinking_tokens,omitempty"`
 }
 
 // ReqMeta is best-effort metadata parsed from the request body.
@@ -60,10 +71,20 @@ type ReqMeta struct {
 
 // ResMeta is best-effort metadata parsed from the response.
 type ResMeta struct {
-	Usage      Usage   `json:"usage"`
-	StopReason string  `json:"stop_reason"`
-	Title      string  `json:"title,omitempty"`
-	Cost       float64 `json:"cost"`
+	Usage      Usage  `json:"usage"`
+	StopReason string `json:"stop_reason"`
+	Title      string `json:"title,omitempty"`
+	// Model is the id the API reported serving, which can differ from the alias
+	// the request asked for. Pricing prefers it over the request's model.
+	Model string `json:"model,omitempty"`
+	// ServiceTier scales the rate: batch is half price. Empty on older captures,
+	// treated as standard.
+	ServiceTier string `json:"service_tier,omitempty"`
+	// Cost is derived, not authoritative. Rate tables change (a model can be
+	// unpriced when recorded and priced later), so every read reprices from the
+	// stored token counts; the persisted number is only a cache of what the
+	// table said at record time.
+	Cost float64 `json:"cost"`
 }
 
 // Exchange is the audit record for one request→response pair. Serialized as the

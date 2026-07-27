@@ -133,11 +133,20 @@ type rawUsage struct {
 	OutputTokens             int `json:"output_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreation            *struct {
+		Ephemeral5m int `json:"ephemeral_5m_input_tokens"`
+		Ephemeral1h int `json:"ephemeral_1h_input_tokens"`
+	} `json:"cache_creation"`
+	OutputTokensDetails *struct {
+		ThinkingTokens int `json:"thinking_tokens"`
+	} `json:"output_tokens_details"`
+	ServiceTier string `json:"service_tier"`
 }
 
 type sseData struct {
 	Type    string `json:"type"`
 	Message *struct {
+		Model      string    `json:"model"`
 		Usage      *rawUsage `json:"usage"`
 		StopReason string    `json:"stop_reason"`
 	} `json:"message"`
@@ -174,12 +183,17 @@ func parseSSE(raw []byte) (model.ResMeta, bool) {
 		any = true
 		switch d.Type {
 		case "message_start":
-			if d.Message != nil && d.Message.Usage != nil {
-				applyUsage(&meta.Usage, d.Message.Usage)
+			if d.Message != nil {
+				if d.Message.Model != "" {
+					meta.Model = d.Message.Model
+				}
+				if d.Message.Usage != nil {
+					applyUsage(&meta, d.Message.Usage)
+				}
 			}
 		case "message_delta":
-			if d.Usage != nil && d.Usage.OutputTokens > 0 {
-				meta.Usage.OutputTokens = d.Usage.OutputTokens
+			if d.Usage != nil {
+				applyUsage(&meta, d.Usage)
 			}
 			if d.Delta != nil && d.Delta.StopReason != "" {
 				meta.StopReason = d.Delta.StopReason
@@ -203,6 +217,7 @@ func parseSSE(raw []byte) (model.ResMeta, bool) {
 func parseJSONMessage(raw []byte) (model.ResMeta, bool) {
 	var msg struct {
 		Type       string    `json:"type"`
+		Model      string    `json:"model"`
 		StopReason string    `json:"stop_reason"`
 		Usage      *rawUsage `json:"usage"`
 		Content    []struct {
@@ -215,8 +230,9 @@ func parseJSONMessage(raw []byte) (model.ResMeta, bool) {
 	}
 	var meta model.ResMeta
 	meta.StopReason = msg.StopReason
+	meta.Model = msg.Model
 	if msg.Usage != nil {
-		applyUsage(&meta.Usage, msg.Usage)
+		applyUsage(&meta, msg.Usage)
 	}
 	var text strings.Builder
 	for _, c := range msg.Content {
@@ -228,7 +244,12 @@ func parseJSONMessage(raw []byte) (model.ResMeta, bool) {
 	return meta, msg.Type != ""
 }
 
-func applyUsage(dst *model.Usage, u *rawUsage) {
+// applyUsage folds one usage object into the accumulating meta. A stream
+// reports usage more than once — message_start carries the input side and the
+// cache-creation TTL split, message_delta the final output count — and each
+// field is assigned rather than added, so a repeated snapshot is idempotent.
+func applyUsage(meta *model.ResMeta, u *rawUsage) {
+	dst := &meta.Usage
 	if u.InputTokens > 0 {
 		dst.InputTokens = u.InputTokens
 	}
@@ -240,6 +261,20 @@ func applyUsage(dst *model.Usage, u *rawUsage) {
 	}
 	if u.CacheCreationInputTokens > 0 {
 		dst.CacheCreateTokens = u.CacheCreationInputTokens
+	}
+	if u.CacheCreation != nil {
+		if u.CacheCreation.Ephemeral5m > 0 {
+			dst.CacheCreate5m = u.CacheCreation.Ephemeral5m
+		}
+		if u.CacheCreation.Ephemeral1h > 0 {
+			dst.CacheCreate1h = u.CacheCreation.Ephemeral1h
+		}
+	}
+	if u.OutputTokensDetails != nil && u.OutputTokensDetails.ThinkingTokens > 0 {
+		dst.ThinkingTokens = u.OutputTokensDetails.ThinkingTokens
+	}
+	if u.ServiceTier != "" {
+		meta.ServiceTier = u.ServiceTier
 	}
 }
 
