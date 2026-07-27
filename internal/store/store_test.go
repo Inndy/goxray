@@ -131,6 +131,23 @@ func TestRecorderFlow(t *testing.T) {
 
 // A cost stamped at record time goes stale as soon as the rate table moves, so
 // reads must recompute it rather than trust what is on disk.
+// A handler that outlives the shutdown deadline can reach a closed store; the
+// late writes must degrade to errors/no-ops, never a send-on-closed-channel
+// panic (an overflow-goroutine panic would take the whole process down).
+func TestStoreWritesAfterCloseNoPanic(t *testing.T) {
+	st := tmpStore(t)
+	rec := st.Recorder
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.Index.Upsert(model.Exchange{ID: "late"}); err == nil {
+		t.Error("Upsert after Close: want error, got nil")
+	}
+	rec.enqueueIndex(model.Exchange{ID: "late"}) // must not panic
+	rec.Close()                                  // second Close must be a no-op
+}
+
 func TestManifestReadRepricesStoredCost(t *testing.T) {
 	man := newLocalManifests(filepath.Join(t.TempDir(), "manifests"))
 

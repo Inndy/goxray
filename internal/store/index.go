@@ -3,10 +3,12 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"maps"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver, registered as "sqlite"
@@ -102,7 +104,15 @@ type Index struct {
 	db      *sql.DB
 	writeCh chan writeReq
 	done    chan struct{}
+
+	// mu orders Upsert's channel send against Close's close(writeCh): a send on
+	// a closed channel panics, and a late Upsert (overflow goroutine, handler
+	// surviving a shutdown deadline) must degrade to an error, not a crash.
+	mu     sync.RWMutex
+	closed bool
 }
+
+var errIndexClosed = errors.New("index closed")
 
 // OpenIndex opens (or creates) the SQLite index. needFullRebuild is true when
 // the DB was absent or its schema version differs — the caller should then run
@@ -160,7 +170,13 @@ func (i *Index) writer() {
 // blocks the caller until done (callers run it off the request hot path).
 func (i *Index) Upsert(ex model.Exchange) error {
 	resp := make(chan error, 1)
+	i.mu.RLock()
+	if i.closed {
+		i.mu.RUnlock()
+		return errIndexClosed
+	}
 	i.writeCh <- writeReq{ex: ex, resp: resp}
+	i.mu.RUnlock()
 	return <-resp
 }
 
@@ -386,7 +402,10 @@ func (i *Index) Reconcile(m ManifestStore) error {
 
 // Close drains pending writes, marks a clean shutdown, and closes the DB.
 func (i *Index) Close() error {
+	i.mu.Lock()
+	i.closed = true
 	close(i.writeCh)
+	i.mu.Unlock()
 	<-i.done // writer drained
 	setMeta(i.db, "clean_shutdown", "1")
 	return i.db.Close()

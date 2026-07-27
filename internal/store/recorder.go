@@ -36,6 +36,13 @@ type Recorder struct {
 	obs  atomic.Pointer[Observer]
 	jobs chan model.Exchange
 	wg   sync.WaitGroup
+
+	// mu orders enqueueIndex against Close: a handler surviving the shutdown
+	// deadline must not send on the closed jobs channel (panic). Guarded adds
+	// also make wg.Wait sound — every Add happens under RLock before closed is
+	// set, so no Add can race the Wait.
+	mu     sync.RWMutex
+	closed bool
 }
 
 // SetObserver installs (or with nil, clears) the live observer. Safe to call at
@@ -162,23 +169,40 @@ func (r *Recorder) PersistResponse(ex *model.Exchange, rawRes []byte) error {
 }
 
 // enqueueIndex hands the exchange to the async index pool without blocking the
-// request goroutine; if the queue is saturated it upserts inline as a fallback
-// (still off the terminal-frame release, which already happened).
+// request goroutine; if the queue is saturated it upserts in a tracked overflow
+// goroutine as a fallback (still off the terminal-frame release, which already
+// happened).
 func (r *Recorder) enqueueIndex(ex model.Exchange) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		// The manifest is already durable; only the projection row is lost, and
+		// only because a handler outlived the shutdown deadline.
+		logf("index enqueue after close %s: row skipped (manifest durable)", ex.ID)
+		return
+	}
 	select {
 	case r.jobs <- ex:
 	default:
-		go func() {
+		r.wg.Go(func() {
 			if err := r.idx.Upsert(ex); err != nil {
 				logf("index upsert (overflow) %s: %v", ex.ID, err)
 			}
-		}()
+		})
 	}
 }
 
-// Close drains the async index queue. Call before Index.Close.
+// Close drains the async index queue, including overflow goroutines. Call
+// before Index.Close.
 func (r *Recorder) Close() {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	r.closed = true
 	close(r.jobs)
+	r.mu.Unlock()
 	r.wg.Wait()
 }
 
