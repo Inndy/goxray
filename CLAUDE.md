@@ -13,13 +13,11 @@ duplicate it here.
 
 | | |
 |---|---|
-| **Stage** | v0 + dashboard MVP, working end to end |
-| **Branch** | `feat/dashboard-ui` (7 commits, each verified to build and test green in isolation) — **not yet merged to `main`** |
+| **Stage** | v0 + dashboard MVP + derived pricing, working end to end |
+| **Branch** | `main` — dashboard and pricing work merged; every commit was verified to build and test green in isolation |
 | **Go** | 1.26, module `go.inndy.tw/goxray` |
 | **Tests** | `go test ./...` — all green. `config`, `model`, `cmd` have no tests |
-| **Size** | ~4.8k lines Go, ~2.6k lines Vue/JS |
-
-Merge when ready: `git switch main && git merge --ff-only feat/dashboard-ui`
+| **Size** | ~5k lines Go, ~2.6k lines Vue/JS |
 
 ---
 
