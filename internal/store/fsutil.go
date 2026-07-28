@@ -63,16 +63,6 @@ func readFile(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
-// fsyncDir flushes a directory's metadata so a rename/create is durable.
-func fsyncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
-
 // shardPath returns dir/<shard>/<id><ext>, sharding by the LAST two chars of
 // the id so no single directory accumulates 100k+ entries. The tail is used
 // because uuidv7 ids lead with a (near-constant) timestamp and carry their
