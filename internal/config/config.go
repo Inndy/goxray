@@ -8,7 +8,18 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
+
+// DefaultArchiveAfter is how long a session must sit idle before the background
+// sweep folds it into a per-session archive.
+//
+// On by default, unlike the dashboard: leaving it off means the store keeps
+// paying O(N^2) for every session, and unlike exposing conversations over HTTP
+// this has no privacy dimension. Every deletion is preceded by re-reading the
+// archive and byte-comparing what it is about to replace, so the failure mode
+// of being wrong here is wasted work, not lost bytes.
+const DefaultArchiveAfter = 30 * time.Minute
 
 // Config is the resolved runtime configuration.
 type Config struct {
@@ -18,7 +29,14 @@ type Config struct {
 	Upstream     *url.URL // resolved upstream base (scheme://host:port)
 	MaxBodyBytes int64
 	NoBrowser    bool // reserved; MVP has no browser
+
+	// ArchiveAfter is the idle window before a session is archived; 0 disables
+	// archiving entirely.
+	ArchiveAfter time.Duration
 }
+
+// ArchiveEnabled reports whether the background archive sweep should run.
+func (c *Config) ArchiveEnabled() bool { return c.ArchiveAfter > 0 }
 
 // UIEnabled reports whether the read-only dashboard should be served.
 //
@@ -35,6 +53,8 @@ func Load(args []string) (*Config, error) {
 	home := fs.String("home", envStr("GOXRAY_HOME", ""), "data directory (default ~/.goxray)")
 	maxBodyMB := fs.Int("max-body-mb", envInt("GOXRAY_MAX_BODY_MB", 50), "max request body size in MiB")
 	upstream := fs.String("upstream", envStr("GOXRAY_UPSTREAM", ""), "override upstream base URL")
+	archiveAfter := fs.Duration("archive-after", envDur("GOXRAY_ARCHIVE_AFTER", DefaultArchiveAfter),
+		"fold sessions idle this long into archives (0 = never)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -47,6 +67,7 @@ func Load(args []string) (*Config, error) {
 		Port:         *port,
 		UIPort:       *uiPort,
 		MaxBodyBytes: int64(*maxBodyMB) * 1024 * 1024,
+		ArchiveAfter: max(*archiveAfter, 0),
 	}
 
 	if *home != "" {
@@ -94,6 +115,15 @@ func (c *Config) IndexPath() string    { return filepath.Join(c.Home, "index.db"
 func envStr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return def
+}
+
+func envDur(k string, def time.Duration) time.Duration {
+	if v := os.Getenv(k); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 	}
 	return def
 }

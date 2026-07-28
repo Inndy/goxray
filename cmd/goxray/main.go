@@ -34,7 +34,7 @@ func main() {
 	// else (or nothing) runs the proxy.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "ls", "show", "raw", "migrate-usage":
+		case "ls", "show", "raw", "migrate-usage", "archive", "fsck":
 			if err := runCLI(os.Args[1], os.Args[2:]); err != nil {
 				fmt.Fprintln(os.Stderr, "goxray:", err)
 				os.Exit(1)
@@ -63,12 +63,23 @@ func serve(args []string) error {
 		return fmt.Errorf("open store: %w", err)
 	}
 
+	// Fold idle sessions into per-session archives in the background. It polls
+	// the index from its own goroutine and never touches the recording path, so
+	// it cannot affect the fail-closed guarantee.
+	sweeper := store.NewSweeper(cfg.BlobsDir(), cfg.ManifestsDir(), cfg.ArchivesDir(),
+		st.Index, cfg.ArchiveAfter)
+	sweeper.Start()
+	defer sweeper.Stop()
+
 	srv := proxy.New(cfg, st.Recorder)
 	httpSrv := &http.Server{Addr: srv.Addr(), Handler: srv.Handler()}
 
 	log.Printf("goxray listening on http://%s", srv.Addr())
 	log.Printf("upstream: %s", cfg.Upstream)
 	log.Printf("home:     %s", cfg.Home)
+	if cfg.ArchiveEnabled() {
+		log.Printf("archiving sessions idle for %s", cfg.ArchiveAfter)
+	}
 	log.Printf("point Claude Code at it:  export %s", cfg.BaseURLLine())
 
 	// Graceful shutdown: stop accepting, drain the index queue, mark clean.
@@ -119,11 +130,14 @@ func serve(args []string) error {
 		if uiSrv != nil {
 			_ = uiSrv.Close()
 		}
+		sweeper.Stop()
 		st.Close()
 		return err
 	case <-sig:
 		log.Printf("shutting down…")
 		shutdown()
+		// Before the store: a pass in flight is holding the index open.
+		sweeper.Stop()
 		if err := st.Close(); err != nil {
 			log.Printf("goxray: store close: %v", err)
 		}
@@ -139,6 +153,8 @@ func printUsage() {
   goxray show <id>            show one exchange's parsed metadata
   goxray raw  <id> [req|res]  dump verbatim recorded bytes (default req)
   goxray migrate-usage        backfill usage detail from stored blobs (--apply)
+  goxray archive              fold idle sessions into archives (--apply)
+  goxray fsck                 verify archive integrity
 
 flags:
   --port N            listen port (env PROXY_PORT, default 5599)
@@ -146,5 +162,7 @@ flags:
   --home DIR          data dir (env GOXRAY_HOME, default ~/.goxray)
   --max-body-mb N     max request body MiB (default 50)
   --upstream URL      override upstream (env GOXRAY_UPSTREAM)
+  --archive-after D   archive idle sessions after D (env GOXRAY_ARCHIVE_AFTER,
+                      default 30m, 0 = off)
 `)
 }
