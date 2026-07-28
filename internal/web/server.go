@@ -32,7 +32,9 @@ type Reader interface {
 	Query(f store.Filter) ([]model.Exchange, error)
 	Sessions(f store.Filter) ([]store.Session, error)
 	Manifest(id string) (*model.Exchange, error)
-	Blob(ref string) ([]byte, error)
+	// Blob takes the exchange's session id alongside the ref: archived bodies
+	// live in a per-session file, and the handler has already read the manifest.
+	Blob(session, ref string) ([]byte, error)
 }
 
 // storeReader adapts the live *store.Store to the read-only Reader, so the
@@ -47,7 +49,9 @@ func (s storeReader) Sessions(f store.Filter) ([]store.Session, error) {
 	return s.st.Index.Sessions(f)
 }
 func (s storeReader) Manifest(id string) (*model.Exchange, error) { return s.st.Manifests.Read(id) }
-func (s storeReader) Blob(ref string) ([]byte, error)             { return s.st.Blobs.Get(ref) }
+func (s storeReader) Blob(session, ref string) ([]byte, error) {
+	return s.st.Blobs.Get(session, ref)
+}
 
 const (
 	defaultLimit = 200
@@ -216,7 +220,7 @@ func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
 
 	if ex.ReqRef == "" {
 		d.Warnings = append(d.Warnings, "request body was not recorded")
-	} else if body, err := s.rd.Blob(ex.ReqRef); err != nil {
+	} else if body, err := s.rd.Blob(ex.Req.SessionID, ex.ReqRef); err != nil {
 		d.Warnings = append(d.Warnings, "request body unreadable: "+err.Error())
 	} else {
 		var req struct {
@@ -247,7 +251,7 @@ func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
 	case ex.ResRef == "":
 		d.Warnings = append(d.Warnings, "response body was not recorded")
 	default:
-		body, err := s.rd.Blob(ex.ResRef)
+		body, err := s.rd.Blob(ex.Req.SessionID, ex.ResRef)
 		if err != nil {
 			d.Warnings = append(d.Warnings, "response body unreadable: "+err.Error())
 			break
@@ -306,7 +310,7 @@ func (s *server) handleRaw(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "no recorded "+side+" body")
 		return
 	}
-	body, err := s.rd.Blob(ref)
+	body, err := s.rd.Blob(ex.Req.SessionID, ref)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

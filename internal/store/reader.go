@@ -18,8 +18,8 @@ type Reader struct {
 
 // OpenReader opens the stores read-only. A missing index (no data recorded yet)
 // is not an error — List simply returns nothing.
-func OpenReader(blobsDir, manifestsDir, indexPath string) (*Reader, error) {
-	blobs, err := newLocalBlobs(blobsDir)
+func OpenReader(blobsDir, manifestsDir, archivesDir, indexPath string) (*Reader, error) {
+	blobs, err := newLocalBlobs(blobsDir, archivesDir)
 	if err != nil {
 		return nil, err
 	}
@@ -35,6 +35,7 @@ func OpenReader(blobsDir, manifestsDir, indexPath string) (*Reader, error) {
 }
 
 func (r *Reader) Close() error {
+	_ = r.blobs.Close()
 	if r.db == nil {
 		return nil
 	}
@@ -49,6 +50,10 @@ func (r *Reader) List(f Filter) ([]model.Exchange, error) {
 	return queryEntries(r.db, f)
 }
 
+// Query is List under the name the archiver's index interface uses, so a
+// *Reader and a live *Index are interchangeable for read-only queries.
+func (r *Reader) Query(f Filter) ([]model.Exchange, error) { return r.List(f) }
+
 // Sessions returns per-session rollups. Empty when no index exists yet.
 func (r *Reader) Sessions(f Filter) ([]Session, error) {
 	if r.db == nil {
@@ -62,7 +67,8 @@ func (r *Reader) Manifest(id string) (*model.Exchange, error) {
 	return r.manifests.Read(id)
 }
 
-// Blob returns the verbatim bytes for a blob ref.
-func (r *Reader) Blob(ref string) ([]byte, error) {
-	return r.blobs.Get(ref)
+// Blob returns the verbatim bytes for a blob ref. session comes from the
+// exchange the ref was read from; see BlobStore.Get.
+func (r *Reader) Blob(session, ref string) ([]byte, error) {
+	return r.blobs.Get(session, ref)
 }

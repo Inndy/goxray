@@ -88,6 +88,7 @@ func (c *Config) BaseURLLine() string {
 
 func (c *Config) BlobsDir() string     { return filepath.Join(c.Home, "blobs") }
 func (c *Config) ManifestsDir() string { return filepath.Join(c.Home, "manifests") }
+func (c *Config) ArchivesDir() string  { return filepath.Join(c.Home, "archives") }
 func (c *Config) IndexPath() string    { return filepath.Join(c.Home, "index.db") }
 
 func envStr(k, def string) string {

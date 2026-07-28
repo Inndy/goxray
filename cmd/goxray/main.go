@@ -57,7 +57,7 @@ func serve(args []string) error {
 		return err
 	}
 
-	st, err := store.Open(cfg.BlobsDir(), cfg.ManifestsDir(), cfg.IndexPath(),
+	st, err := store.Open(cfg.BlobsDir(), cfg.ManifestsDir(), cfg.ArchivesDir(), cfg.IndexPath(),
 		model.ProviderAnthropic, runtime.GOMAXPROCS(0))
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)

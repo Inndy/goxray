@@ -33,7 +33,7 @@ func (f *fakeReader) Manifest(id string) (*model.Exchange, error) {
 	return nil, os.ErrNotExist
 }
 
-func (f *fakeReader) Blob(ref string) ([]byte, error) {
+func (f *fakeReader) Blob(_, ref string) ([]byte, error) {
 	if b, ok := f.blobs[ref]; ok {
 		return b, nil
 	}

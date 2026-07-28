@@ -11,19 +11,8 @@ import (
 // entry). This is the durability primitive behind every blob and manifest write.
 func writeFileSync(path string, data []byte) error {
 	dir := filepath.Dir(path)
-	if _, err := os.Stat(dir); err != nil {
-		if !os.IsNotExist(err) {
-			return err
-		}
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-		// A freshly created shard dir is itself a dirent in its parent; without
-		// fsyncing the parent, a crash can drop the whole directory — and with
-		// it a manifest PersistRequest already reported durable.
-		if err := fsyncDir(filepath.Dir(dir)); err != nil {
-			return err
-		}
+	if err := ensureDir(dir); err != nil {
+		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
@@ -51,6 +40,22 @@ func writeFileSync(path string, data []byte) error {
 		return err
 	}
 	return fsyncDir(dir)
+}
+
+// ensureDir creates dir if absent and fsyncs its parent. A freshly created
+// shard dir is itself a dirent in its parent; without fsyncing the parent, a
+// crash can drop the whole directory — and with it a manifest PersistRequest
+// already reported durable.
+func ensureDir(dir string) error {
+	if _, err := os.Stat(dir); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return fsyncDir(filepath.Dir(dir))
 }
 
 // readFile reads a whole file (thin wrapper for symmetry with writeFileSync).

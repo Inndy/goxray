@@ -18,13 +18,13 @@ func runCLI(cmd string, args []string) error {
 	if err != nil {
 		return err
 	}
-	// migrate-usage is the one subcommand that writes, so it does not open the
-	// read-only Reader.
+	// migrate-usage is the one subcommand that rewrites manifests, so it does
+	// not open the read-only Reader.
 	if cmd == "migrate-usage" {
 		return cmdMigrateUsage(cfg, args)
 	}
 
-	rd, err := store.OpenReader(cfg.BlobsDir(), cfg.ManifestsDir(), cfg.IndexPath())
+	rd, err := store.OpenReader(cfg.BlobsDir(), cfg.ManifestsDir(), cfg.ArchivesDir(), cfg.IndexPath())
 	if err != nil {
 		return err
 	}
@@ -50,7 +50,7 @@ func cmdMigrateUsage(cfg *config.Config, args []string) error {
 		return err
 	}
 
-	st, err := store.MigrateUsage(cfg.BlobsDir(), cfg.ManifestsDir(), wire.Anthropic{}, *apply)
+	st, err := store.MigrateUsage(cfg.BlobsDir(), cfg.ManifestsDir(), cfg.ArchivesDir(), wire.Anthropic{}, *apply)
 	if err != nil {
 		return err
 	}
@@ -129,7 +129,7 @@ func cmdRaw(rd *store.Reader, args []string) error {
 	if ref == "" {
 		return fmt.Errorf("no %s blob for %s", which, args[0])
 	}
-	data, err := rd.Blob(ref)
+	data, err := rd.Blob(ex.Req.SessionID, ref)
 	if err != nil {
 		return fmt.Errorf("read blob %s: %w", ref, err)
 	}

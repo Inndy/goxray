@@ -25,7 +25,7 @@ func tmpStore(t *testing.T) *Store {
 	t.Helper()
 	d := t.TempDir()
 	st, err := Open(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"),
-		filepath.Join(d, "index.db"), model.ProviderAnthropic, 2)
+		filepath.Join(d, "archives"), filepath.Join(d, "index.db"), model.ProviderAnthropic, 2)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -34,7 +34,7 @@ func tmpStore(t *testing.T) *Store {
 
 func TestBlobRoundTrip(t *testing.T) {
 	d := t.TempDir()
-	b, err := newLocalBlobs(filepath.Join(d, "blobs"))
+	b, err := newLocalBlobs(filepath.Join(d, "blobs"), filepath.Join(d, "archives"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestBlobRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := b.Get(ref)
+	got, err := b.Get("", ref)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,8 @@ func TestRecorderFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rd, err := OpenReader(st.Blobs.(*localBlobs).dir, st.Manifests.(*localManifests).dir, indexOf(t, st))
+	rd, err := OpenReader(st.Blobs.(*localBlobs).dir, st.Manifests.(*localManifests).dir,
+		st.Blobs.(*localBlobs).archives, indexOf(t, st))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +114,7 @@ func TestRecorderFlow(t *testing.T) {
 	}
 
 	// Raw response blob is byte-exact.
-	raw, err := rd.Blob(m.ResRef)
+	raw, err := rd.Blob(m.Req.SessionID, m.ResRef)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +187,7 @@ func (f *flakyBlobs) Put(b []byte) (string, error) {
 // masquerade as a crash-interrupted turn.
 func TestBlobFailureRecordsPersistFailed(t *testing.T) {
 	d := t.TempDir()
-	blobs, err := newLocalBlobs(filepath.Join(d, "blobs"))
+	blobs, err := newLocalBlobs(filepath.Join(d, "blobs"), filepath.Join(d, "archives"))
 	if err != nil {
 		t.Fatal(err)
 	}

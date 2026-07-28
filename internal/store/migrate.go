@@ -43,13 +43,14 @@ const migrateQuiesce = time.Minute
 // Safe to run against a live store: inflight and recently-written manifests are
 // skipped, and each rewrite is an atomic temp-file rename. Idempotent — a second
 // pass over already-migrated records reports zero updates.
-func MigrateUsage(blobsDir, manifestsDir string, parser wire.WireParser, apply bool) (MigrateStats, error) {
+func MigrateUsage(blobsDir, manifestsDir, archivesDir string, parser wire.WireParser, apply bool) (MigrateStats, error) {
 	var st MigrateStats
 
-	blobs, err := newLocalBlobs(blobsDir)
+	blobs, err := newLocalBlobs(blobsDir, archivesDir)
 	if err != nil {
 		return st, err
 	}
+	defer blobs.Close()
 	manifests := newLocalManifests(manifestsDir)
 	cutoff := time.Now().Add(-migrateQuiesce)
 
@@ -82,7 +83,7 @@ func MigrateUsage(blobsDir, manifestsDir string, parser wire.WireParser, apply b
 			return nil
 		}
 
-		raw, err := blobs.Get(ex.ResRef)
+		raw, err := blobs.Get(ex.Req.SessionID, ex.ResRef)
 		if err != nil {
 			st.Failed++
 			return nil

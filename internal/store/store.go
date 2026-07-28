@@ -23,14 +23,14 @@ type Store struct {
 // Open wires the stores, brings the index up to date (full rebuild on
 // schema/DB loss, else tail reconcile after an unclean shutdown), and starts the
 // recorder's async index pool.
-func Open(blobsDir, manifestsDir, indexPath string, provider model.Provider, workers int) (*Store, error) {
+func Open(blobsDir, manifestsDir, archivesDir, indexPath string, provider model.Provider, workers int) (*Store, error) {
 	// Ensure the home layout exists before SQLite tries to create index.db.
-	for _, d := range []string{blobsDir, manifestsDir, filepath.Dir(indexPath)} {
+	for _, d := range []string{blobsDir, manifestsDir, archivesDir, filepath.Dir(indexPath)} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, err
 		}
 	}
-	blobs, err := newLocalBlobs(blobsDir)
+	blobs, err := newLocalBlobs(blobsDir, archivesDir)
 	if err != nil {
 		return nil, err
 	}
@@ -58,6 +58,12 @@ func Open(blobsDir, manifestsDir, indexPath string, provider model.Provider, wor
 // Close drains the recorder then closes the index (marking a clean shutdown).
 func (s *Store) Close() error {
 	s.Recorder.Close()
+	// Release any archive handles the blob store is holding open. Optional
+	// rather than part of BlobStore, so a backend with nothing to release does
+	// not have to say so.
+	if c, ok := s.Blobs.(interface{ Close() error }); ok {
+		_ = c.Close()
+	}
 	return s.Index.Close()
 }
 

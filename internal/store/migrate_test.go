@@ -27,8 +27,9 @@ func TestMigrateUsageBackfillsTTLSplit(t *testing.T) {
 	d := t.TempDir()
 	blobsDir := filepath.Join(d, "blobs")
 	manDir := filepath.Join(d, "manifests")
+	arcDir := filepath.Join(d, "archives")
 
-	blobs, err := newLocalBlobs(blobsDir)
+	blobs, err := newLocalBlobs(blobsDir, arcDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +55,7 @@ func TestMigrateUsageBackfillsTTLSplit(t *testing.T) {
 
 	// Freshly written manifests are inside the quiesce window, where the recorder
 	// may still be about to supersede them.
-	st, err := MigrateUsage(blobsDir, manDir, wire.Anthropic{}, true)
+	st, err := MigrateUsage(blobsDir, manDir, arcDir, wire.Anthropic{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +65,7 @@ func TestMigrateUsageBackfillsTTLSplit(t *testing.T) {
 
 	backdate(t, man.path(id))
 
-	st, err = MigrateUsage(blobsDir, manDir, wire.Anthropic{}, false)
+	st, err = MigrateUsage(blobsDir, manDir, arcDir, wire.Anthropic{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +79,7 @@ func TestMigrateUsageBackfillsTTLSplit(t *testing.T) {
 		t.Error("dry run wrote to disk")
 	}
 
-	if _, err := MigrateUsage(blobsDir, manDir, wire.Anthropic{}, true); err != nil {
+	if _, err := MigrateUsage(blobsDir, manDir, arcDir, wire.Anthropic{}, true); err != nil {
 		t.Fatal(err)
 	}
 	got, err := man.Read(id)
@@ -100,7 +101,7 @@ func TestMigrateUsageBackfillsTTLSplit(t *testing.T) {
 
 	// Re-running must find nothing left to do.
 	backdate(t, man.path(id))
-	again, err := MigrateUsage(blobsDir, manDir, wire.Anthropic{}, true)
+	again, err := MigrateUsage(blobsDir, manDir, arcDir, wire.Anthropic{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}

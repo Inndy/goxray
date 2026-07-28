@@ -115,7 +115,7 @@ func TestSourceSlugStrippedAndRecorded(t *testing.T) {
 	defer up.Close()
 
 	d := t.TempDir()
-	st, err := store.Open(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"),
+	st, err := store.Open(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "archives"),
 		filepath.Join(d, "index.db"), model.ProviderAnthropic, 2)
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +137,7 @@ func TestSourceSlugStrippedAndRecorded(t *testing.T) {
 	}
 	st.Close()
 
-	rd, _ := store.OpenReader(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "index.db"))
+	rd, _ := store.OpenReader(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "archives"), filepath.Join(d, "index.db"))
 	defer rd.Close()
 	rows, _ := rd.List(store.Filter{Limit: 10})
 	if len(rows) != 1 {
@@ -164,7 +164,7 @@ func TestStreamingRoundTrip(t *testing.T) {
 	defer up.Close()
 
 	d := t.TempDir()
-	st, err := store.Open(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"),
+	st, err := store.Open(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "archives"),
 		filepath.Join(d, "index.db"), model.ProviderAnthropic, 2)
 	if err != nil {
 		t.Fatal(err)
@@ -194,7 +194,7 @@ func TestStreamingRoundTrip(t *testing.T) {
 	}
 
 	// Verify durable record.
-	rd, _ := store.OpenReader(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "index.db"))
+	rd, _ := store.OpenReader(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "archives"), filepath.Join(d, "index.db"))
 	defer rd.Close()
 	rows, err := rd.List(store.Filter{Limit: 10})
 	if err != nil || len(rows) != 1 {
@@ -203,7 +203,7 @@ func TestStreamingRoundTrip(t *testing.T) {
 	if rows[0].State != model.StateComplete {
 		t.Errorf("state = %q", rows[0].State)
 	}
-	raw, err := rd.Blob(rows[0].ResRef)
+	raw, err := rd.Blob(rows[0].Req.SessionID, rows[0].ResRef)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestNonSSELargeResponseNotTruncated(t *testing.T) {
 	defer up.Close()
 
 	d := t.TempDir()
-	st, _ := store.Open(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"),
+	st, _ := store.Open(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "archives"),
 		filepath.Join(d, "index.db"), model.ProviderAnthropic, 2)
 	cfg := testCfg(t, up.URL)
 	cfg.MaxBodyBytes = 1024
@@ -297,13 +297,13 @@ func TestNonSSELargeResponseNotTruncated(t *testing.T) {
 	}
 	st.Close()
 
-	rd, _ := store.OpenReader(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "index.db"))
+	rd, _ := store.OpenReader(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "archives"), filepath.Join(d, "index.db"))
 	defer rd.Close()
 	rows, _ := rd.List(store.Filter{Limit: 10})
 	if len(rows) != 1 {
 		t.Fatalf("want 1 row, got %d", len(rows))
 	}
-	raw, err := rd.Blob(rows[0].ResRef)
+	raw, err := rd.Blob(rows[0].Req.SessionID, rows[0].ResRef)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestNonSSECommitsBeforeClientWrite(t *testing.T) {
 	defer up.Close()
 
 	d := t.TempDir()
-	st, _ := store.Open(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"),
+	st, _ := store.Open(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "archives"),
 		filepath.Join(d, "index.db"), model.ProviderAnthropic, 2)
 	srv := New(testCfg(t, up.URL), st.Recorder)
 	ts := httptest.NewServer(srv.Handler())
@@ -336,7 +336,7 @@ func TestNonSSECommitsBeforeClientWrite(t *testing.T) {
 	}
 	st.Close()
 
-	rd, _ := store.OpenReader(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "index.db"))
+	rd, _ := store.OpenReader(filepath.Join(d, "blobs"), filepath.Join(d, "manifests"), filepath.Join(d, "archives"), filepath.Join(d, "index.db"))
 	defer rd.Close()
 	rows, _ := rd.List(store.Filter{Limit: 10})
 	if len(rows) != 1 || rows[0].State != model.StateComplete {
