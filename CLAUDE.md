@@ -29,7 +29,16 @@ tagging, noise classification, unclean-shutdown reconcile. Verbatim capture, so
 an API shape change can only null a parsed field (`parse_ok=0`), never lose data.
 
 **CLI.** `goxray ls | show | raw`, all read-only through `store.Reader`, plus
-`goxray migrate-usage` — the one writing subcommand.
+the writing subcommands `goxray migrate-usage`, `goxray archive`, and
+`goxray fsck`.
+
+**Session archiving (this cycle).** Once a session has been idle for
+`--archive-after` (default 30m), its request and response bodies are folded into
+one self-contained file: content-defined chunks, deduplicated within the
+session, unique chunks compressed as a solid zstd pool. Measured on the real
+store, **131.4 MiB → 4.6 MiB (28.7×)**. The write path is untouched. See
+[docs/blob-storage.md](docs/blob-storage.md) for the measurements behind every
+parameter.
 
 **Dashboard (this cycle).** `--ui-port N` starts a second, read-only HTTP server
 inside the `serve` process. Sessions → turns → detail with four tabs (Timeline /
@@ -58,7 +67,19 @@ is a bug even if every test passes.
 6. **The dashboard is read-only and opt-in.** Its handlers reach the store only
    through the `web.Reader` interface — no blob, manifest, or index writes. Off
    unless `--ui-port` is passed.
-7. **`internal/web/dist` is committed on purpose.** It is embedded via
+7. **Archiving never deletes what it has not just proven.** Every pass writes
+   the archive, reopens it *from disk*, and byte-compares every body against the
+   live file before unlinking anything — and refuses to install a replacement
+   that would drop a ref the current archive holds. Blob reads try `.zst` before
+   the archive, so the overlap window and `--unarchive` are correct by
+   construction.
+8. **An archive is self-contained.** Nothing in one references anything outside
+   it: no shared dictionary, no global chunk pool, no other archive. The store's
+   dependency graph stays a forest of depth one, which is why deletion and
+   integrity are per-session and there are no refcounts. A resumed session is
+   *rebuilt*, never chained onto — measured smaller than chaining, and it keeps
+   the graph edge-free.
+9. **`internal/web/dist` is committed on purpose.** It is embedded via
    `//go:embed all:dist` so `go install` works without Node. Rebuild it (`make
    ui`) whenever anything under `ui/` changes, or the binary silently ships a
    stale UI.
@@ -279,6 +300,19 @@ rule that holds for index rebuilds. Reusing the parser is not optional: a stream
 reports usage in several events, so anything that sums instead of assigning
 double-counts. Safe against a running proxy (inflight and sub-minute-old
 manifests are skipped, writes are atomic renames) and idempotent.
+
+**Reclaiming disk.** Archiving runs on its own in `serve`; these are for doing
+it by hand or checking it.
+
+```bash
+goxray archive                  # dry run: sessions eligible and bytes at stake
+goxray archive --apply          # fold idle sessions into archives
+goxray fsck                     # verify every chunk against its own hash
+goxray archive --unarchive --apply   # put it all back, byte for byte
+```
+
+`--archive-after 0` disables the background sweep. A hand-run `archive` and the
+sweep exclude each other through a lock file in `archives/`.
 
 **Vite dev proxy needs `changeOrigin: true`** or the guard rejects the
 dev-proxied `Host`. Already set in `ui/vite.config.js`; do not remove it.
