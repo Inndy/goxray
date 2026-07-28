@@ -6,3 +6,6 @@ ui/node_modules/
 
 # internal/web/dist is intentionally NOT ignored: the built dashboard is
 # committed so `go install` produces a working binary without a Node toolchain.
+
+# Local copies of a goxray store: real conversation content, never committed.
+/goxray-data/
