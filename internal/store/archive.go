@@ -61,6 +61,27 @@ const (
 	archiveWindow = 1 << 24
 )
 
+// Format limits. Every count, offset and length in an archive header is
+// untrusted input: fsck exists because a stored archive can be damaged, so a few
+// corrupted bytes must produce a reported integrity error rather than a
+// multi-gigabyte allocation in whatever process happened to read the file — the
+// dashboard included. Each limit is also enforced by the builder, so it can only
+// ever reject a file goxray did not write.
+const (
+	// archiveMaxFrameRaw is one decoded pool frame: the builder flushes at
+	// poolFlushAt and can overshoot by at most one chunk.
+	archiveMaxFrameRaw = poolFlushAt + chunkMax
+	// archiveMaxPool is every frame of one archive decoded, i.e. the session's
+	// unique content. The largest measured on a real store was 10.7 MiB.
+	archiveMaxPool = 2 << 30
+	// archiveMaxMeta bounds one decoded metadata section, and doubles as the
+	// decoder's memory ceiling — it must stay above archiveMaxFrameRaw.
+	archiveMaxMeta = 256 << 20
+	// archiveMaxBody is one reassembled body. Bodies are HTTP request and
+	// response bodies; the largest in this store is under 10 MiB.
+	archiveMaxBody = 256 << 20
+)
+
 // errNotInArchive means the archive is intact and simply does not hold this
 // ref. Callers distinguish it from corruption: a partially archived session is
 // normal (turns that arrived mid-build stay live as .zst files).
@@ -95,6 +116,7 @@ type archiveBuilder struct {
 	pool     []byte // current uncompressed frame
 	frames   [][]byte
 	frameRaw []uint32
+	poolRaw  int64 // every frame, flushed or not: bounded by archiveMaxPool
 
 	refs []refEntry
 	seen map[string]bool
@@ -128,6 +150,13 @@ func (b *archiveBuilder) Add(ref string, raw []byte) error {
 	if b.seen[ref] {
 		return fmt.Errorf("archive: duplicate ref %s", ref)
 	}
+	// The reader refuses to reassemble a body or a pool past these limits, so
+	// refusing to write one is what keeps a limit from ever locking a body it
+	// accepted out of reach. A session this large is not archived at all: its
+	// blobs stay live and every pass reports the failure.
+	if len(raw) > archiveMaxBody {
+		return fmt.Errorf("archive: body %s is %d bytes, over the %d-byte limit", ref, len(raw), archiveMaxBody)
+	}
 	b.seen[ref] = true
 
 	recipe := make([]byte, 0, 64)
@@ -143,6 +172,7 @@ func (b *archiveBuilder) Add(ref string, raw []byte) error {
 			b.hashes = append(b.hashes, h16)
 			b.locs = append(b.locs, chunkLoc{frame: uint32(len(b.frames)), off: uint32(len(b.pool)), n: uint32(len(c))})
 			b.pool = append(b.pool, c...)
+			b.poolRaw += int64(len(c))
 			if len(b.pool) >= poolFlushAt {
 				b.flush()
 			}
@@ -151,6 +181,11 @@ func (b *archiveBuilder) Add(ref string, raw []byte) error {
 		prev = int64(id)
 		recipe = binary.AppendUvarint(recipe, uint64(d<<1)^uint64(d>>63))
 	})
+	// Checked after the walk rather than inside it: eachChunk cannot fail, and
+	// the overshoot is bounded by this one body.
+	if b.poolRaw > archiveMaxPool {
+		return fmt.Errorf("archive: pool reached %d bytes, over the %d-byte limit", b.poolRaw, archiveMaxPool)
+	}
 	b.refs = append(b.refs, refEntry{ref: ref, recipe: recipe})
 	return nil
 }
@@ -276,7 +311,7 @@ func openArchive(path string) (*archiveReader, error) {
 	dirOff := binary.LittleEndian.Uint64(hdr[44:])
 	dirLen := binary.LittleEndian.Uint32(hdr[52:])
 
-	dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(1<<31))
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(archiveMaxMeta))
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -284,18 +319,20 @@ func openArchive(path string) (*archiveReader, error) {
 	a := &archiveReader{
 		path: path, f: f, dec: dec,
 		modTime: fi.ModTime().UnixNano(), size: fi.Size(),
-		refs: make(map[string][]byte, nrefs),
 	}
 	fail := func(err error) (*archiveReader, error) {
 		a.Close()
 		return nil, err
 	}
 
+	// Nothing below allocates on a length the file has not been shown to hold.
+	// The arithmetic is deliberately overflow-free: off is 64-bit and off+n would
+	// wrap for a corrupt header, which is exactly the input this guards against.
 	sect := func(off uint64, n uint32, what string) ([]byte, error) {
 		if n == 0 {
 			return nil, nil
 		}
-		if off+uint64(n) > uint64(fi.Size()) {
+		if off < archiveHeaderLen || off > uint64(a.size) || uint64(n) > uint64(a.size)-off {
 			return nil, fmt.Errorf("archive %s: %s section past EOF", path, what)
 		}
 		buf := make([]byte, n)
@@ -305,6 +342,44 @@ func openArchive(path string) (*archiveReader, error) {
 		return buf, nil
 	}
 
+	// The frame directory comes first even though it sits third in the file: it
+	// is uncompressed, it bounds the whole pool, and the chunk table is only
+	// meaningful checked against it.
+	if int64(nframes)*frameDirLen != int64(dirLen) {
+		return fail(fmt.Errorf("archive %s: frame dir is %d bytes, want %d for %d frames",
+			path, dirLen, int64(nframes)*frameDirLen, nframes))
+	}
+	dirbuf, err := sect(dirOff, dirLen, "dir")
+	if err != nil {
+		return fail(err)
+	}
+	a.dir = make([]frameDir, nframes)
+	var poolRaw int64
+	for i := range a.dir {
+		e := dirbuf[i*frameDirLen:]
+		d := frameDir{
+			off:     binary.LittleEndian.Uint64(e),
+			compLen: binary.LittleEndian.Uint32(e[8:]),
+			rawLen:  binary.LittleEndian.Uint32(e[12:]),
+		}
+		if d.off < archiveHeaderLen || d.off > uint64(a.size) || uint64(d.compLen) > uint64(a.size)-d.off {
+			return fail(fmt.Errorf("archive %s: frame %d runs past EOF", path, i))
+		}
+		if d.compLen == 0 || d.rawLen == 0 || d.rawLen > archiveMaxFrameRaw {
+			return fail(fmt.Errorf("archive %s: frame %d claims %d raw bytes from %d compressed",
+				path, i, d.rawLen, d.compLen))
+		}
+		poolRaw += int64(d.rawLen)
+		if poolRaw > archiveMaxPool {
+			return fail(fmt.Errorf("archive %s: pool claims over %d bytes", path, archiveMaxPool))
+		}
+		a.dir[i] = d
+	}
+	a.pool = make([][]byte, nframes)
+
+	if int64(nchunks)*chunkEntryLen > archiveMaxMeta {
+		return fail(fmt.Errorf("archive %s: header claims %d chunks", path, nchunks))
+	}
 	ctab, err := sect(tableOff, tableLen, "table")
 	if err != nil {
 		return fail(err)
@@ -315,20 +390,30 @@ func openArchive(path string) (*archiveReader, error) {
 			return fail(fmt.Errorf("archive %s: decode table: %w", path, err))
 		}
 	}
-	if len(table) != int(nchunks)*chunkEntryLen {
+	if int64(len(table)) != int64(nchunks)*chunkEntryLen {
 		return fail(fmt.Errorf("archive %s: table is %d bytes, want %d for %d chunks",
-			path, len(table), int(nchunks)*chunkEntryLen, nchunks))
+			path, len(table), int64(nchunks)*chunkEntryLen, nchunks))
 	}
 	a.locs = make([]chunkLoc, nchunks)
 	a.hashes = make([][16]byte, nchunks)
 	for i := range a.locs {
 		e := table[i*chunkEntryLen:]
 		copy(a.hashes[i][:], e[:16])
-		a.locs[i] = chunkLoc{
+		l := chunkLoc{
 			frame: binary.LittleEndian.Uint32(e[16:]),
 			off:   binary.LittleEndian.Uint32(e[20:]),
 			n:     binary.LittleEndian.Uint32(e[24:]),
 		}
+		// Resolving a chunk against its frame here means Get's length pass
+		// cannot be talked into sizing a buffer for chunks that do not fit.
+		if int64(l.frame) >= int64(len(a.dir)) {
+			return fail(fmt.Errorf("archive %s: chunk %d names frame %d of %d", path, i, l.frame, len(a.dir)))
+		}
+		if l.n == 0 || l.n > chunkMax || uint64(l.off)+uint64(l.n) > uint64(a.dir[l.frame].rawLen) {
+			return fail(fmt.Errorf("archive %s: chunk %d is %d bytes at offset %d, outside frame %d",
+				path, i, l.n, l.off, l.frame))
+		}
+		a.locs[i] = l
 	}
 
 	crefs, err := sect(refsOff, refsLen, "refs")
@@ -341,6 +426,15 @@ func openArchive(path string) (*archiveReader, error) {
 			return fail(fmt.Errorf("archive %s: decode refs: %w", path, err))
 		}
 	}
+	// nrefs is only a hint until the section proves it: every entry costs at
+	// least a length pair and one byte of ref, so the decoded size is the real
+	// bound on how many there can be.
+	const minRefEntry = 2 + 1 + 4
+	hint := int64(nrefs)
+	if room := int64(len(refbuf)/minRefEntry) + 1; hint > room {
+		hint = room
+	}
+	a.refs = make(map[string][]byte, int(hint))
 	for i := uint32(0); i < nrefs; i++ {
 		if len(refbuf) < 2 {
 			return fail(fmt.Errorf("archive %s: refs truncated", path))
@@ -361,24 +455,6 @@ func openArchive(path string) (*archiveReader, error) {
 		a.order = append(a.order, ref)
 		refbuf = refbuf[pl:]
 	}
-
-	dirbuf, err := sect(dirOff, dirLen, "dir")
-	if err != nil {
-		return fail(err)
-	}
-	if len(dirbuf) != int(nframes)*frameDirLen {
-		return fail(fmt.Errorf("archive %s: frame dir is %d bytes, want %d", path, len(dirbuf), int(nframes)*frameDirLen))
-	}
-	a.dir = make([]frameDir, nframes)
-	for i := range a.dir {
-		e := dirbuf[i*frameDirLen:]
-		a.dir[i] = frameDir{
-			off:     binary.LittleEndian.Uint64(e),
-			compLen: binary.LittleEndian.Uint32(e[8:]),
-			rawLen:  binary.LittleEndian.Uint32(e[12:]),
-		}
-	}
-	a.pool = make([][]byte, nframes)
 	return a, nil
 }
 
@@ -478,6 +554,9 @@ func (a *archiveReader) recipeLen(ref string, recipe []byte) (int, error) {
 			return 0, fmt.Errorf("archive %s: %s: chunk id %d out of range", a.path, ref, id)
 		}
 		total += int64(a.locs[id].n)
+		if total > archiveMaxBody {
+			return 0, fmt.Errorf("archive %s: %s: body claims over %d bytes", a.path, ref, archiveMaxBody)
+		}
 	}
 	return int(total), nil
 }

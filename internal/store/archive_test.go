@@ -2,11 +2,13 @@ package store
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -180,6 +182,70 @@ func TestArchiveRejectsGarbage(t *testing.T) {
 		if err == nil {
 			a.Close()
 			t.Errorf("%s: opened without error", name)
+		}
+	}
+}
+
+// A damaged header must be reported, and reported *cheaply*. Every count in it
+// is a length the reader would otherwise allocate on trust: a single flipped
+// nrefs used to ask for a four-billion-entry map and take the process down with
+// it, which turns `goxray fsck` — the tool for finding damage — into the thing
+// the damage kills.
+func TestArchiveRejectsImpossibleHeader(t *testing.T) {
+	bodies := conversation(6)
+	refs := []string{"r0", "r1", "r2", "r3", "r4", "r5"}
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good"+archiveExt)
+	buildArchive(t, good, refs, bodies)
+	clean, err := os.ReadFile(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirOff := binary.LittleEndian.Uint64(clean[44:])
+
+	for _, tc := range []struct {
+		name string
+		at   int
+		size int // 4 or 8 bytes
+		val  uint64
+	}{
+		{"nchunks", 8, 4, 0xfffffff0},
+		{"nframes", 12, 4, 0xfffffff0},
+		{"nrefs", 16, 4, 0xfffffff0},
+		{"tableOff", 20, 8, 1 << 60},
+		{"tableLen", 28, 4, 0xfffffff0},
+		{"refsOff", 32, 8, 0xffffffffffffff00},
+		{"refsLen", 40, 4, 0xfffffff0},
+		{"dirOff", 44, 8, 0},
+		{"dirLen", 52, 4, 0xfffffff0},
+		// Not the header: the frame directory, whose compLen is the read size
+		// for a pool frame.
+		{"frameCompLen", int(dirOff) + 8, 4, 0xfffffff0},
+		{"frameRawLen", int(dirOff) + 12, 4, 0xfffffff0},
+	} {
+		raw := append([]byte(nil), clean...)
+		if tc.size == 4 {
+			binary.LittleEndian.PutUint32(raw[tc.at:], uint32(tc.val))
+		} else {
+			binary.LittleEndian.PutUint64(raw[tc.at:], tc.val)
+		}
+		p := filepath.Join(dir, tc.name+archiveExt)
+		if err := os.WriteFile(p, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		a, err := openArchive(p)
+		runtime.ReadMemStats(&after)
+		if err == nil {
+			a.Close()
+			t.Errorf("%s: opened an archive claiming %d", tc.name, tc.val)
+			continue
+		}
+		// A rejection that first allocates gigabytes is not a rejection.
+		if grew := after.TotalAlloc - before.TotalAlloc; grew > 32<<20 {
+			t.Errorf("%s: rejected the file but allocated %d MiB doing it", tc.name, grew>>20)
 		}
 	}
 }
