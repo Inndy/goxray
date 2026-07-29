@@ -321,6 +321,69 @@ leaving newer turns live. The next cold rebuild merges them.
    needs a real lock — an flock on a file in the store root, taken for the
    duration of a session's rebuild.
 
+   *What shipped:* `archives/.lock`, created `O_EXCL`, because Go's `syscall`
+   package has no flock on Windows and this repo ships a Windows binary. The
+   weaker primitive needs three things flock gives for free, and the first
+   version had none of them:
+
+   - The file carries a **random token** identifying its owner, so a pass that
+     was declared abandoned and taken over cannot delete its successor's lock on
+     the way out — which was a way for two passes to end up running at once even
+     without a crash.
+   - The holder **refreshes it every 30 s**, so a lock is only stolen after five
+     minutes of genuine silence. Before that, a merely *slow* pass could be
+     stolen from, and its stale snapshot could then rename over a newer archive
+     and drop refs whose live blobs the newer pass had already unlinked.
+   - Every step that deletes anything **re-reads the token first**, and the
+     install re-stats the archive it verified against immediately before the
+     rename. A pass that has lost the lock, or whose target changed while it was
+     building, aborts instead of installing.
+
+   - Release is **close, then unlink**, in that order. Go opens files on Windows
+     without `FILE_SHARE_DELETE`, so removing a file this process still holds
+     open fails there; the first version removed first and so left its lock
+     behind on every successful pass, blocking the next one until the TTL.
+
+   What remains is a stat-to-rename window of microseconds, reachable only by a
+   process that was silent for five minutes and then resumed mid-pass. `fsck`
+   reports the outcome if it ever happens; the archive itself cannot be corrupted
+   by it, only replaced by an older complete one.
+
+   The honest reading is that a lease is not a lock and no amount of checking
+   makes it one — the fix is `syscall.Flock` on unix and `LockFileEx` (in the
+   `x/sys` already in the build) on Windows, held on `archives/.lock` for the
+   pass, which deletes the token, the heartbeat, the TTL and the stealing
+   outright. It costs nothing at the install: the lock is on the lock file, not
+   on the archive, so `os.Rename` is untouched. It is not done because the
+   remaining window needs a process stopped for five minutes in the middle of a
+   pass.
+
+5. **A session id is not a filename.** `metadata.session_id` is whatever the
+   recorded request said, and finding an archive by name (below) makes it a path.
+   Without a check, `../../../x` as a session id points an applied sweep at a
+   `.gxa` path outside the store.
+
+   Normalized **once, where it enters the store** (`PersistRequest`), rather than
+   at each read: uuids pass through, so the filename remains the session id and
+   nothing downstream has to remember to sanitize one; anything else becomes
+   `h-<digest>`. `archiveFile` is the only place the id becomes a path, and it
+   refuses one that is not a name — pre-boundary manifests still hold raw ids, so
+   those sessions are skipped rather than filed somewhere a reader would not look.
+
+   Which leaves the inverse case: an archive file whose name no session id
+   resolves to, written before the boundary existed or moved by hand. `fsck` names
+   it and withholds its refs from the verified set, so the manifests pointing into
+   it report unreadable rather than clean, and `--unarchive` restores from the
+   files it finds on disk rather than from session ids, so it can reach the file
+   and put the bodies back. Recovery reads a directory; it never takes a path from
+   a manifest.
+
+6. **Every length in an archive header is checked before it is allocated.** The
+   file is the thing whose damage `fsck` exists to find, so it cannot be trusted
+   to size a buffer: counts and offsets are validated against the file size and
+   against limits the builder itself enforces. A flipped `nrefs` used to ask for
+   a four-billion-entry map and take the reading process down with it.
+
 Rebuild costs 59 ms for a typical session and about 200 ms for the largest in
 this store, so there is no need for throttling beyond the per-tick cap.
 
@@ -340,6 +403,21 @@ most-recent-first, so already-archived sessions would fill the budget on every
 tick and older ones would never be reached. Candidates are also filtered by one
 `stat` — an archive newer than the session's last turn already covers it — so a
 store full of archived sessions does not re-examine all of them every tick.
+
+Attempts are capped separately, at twice `Max`, because bounding only successes
+lets sessions that fail every time make one tick unboundedly long. A session is
+counted as archived — and its bytes as reclaimed — only after the archive is
+installed and the blobs are gone.
+
+Neither cap is fairness, though, and that took a second look to see. Candidates
+come newest-first, so whatever fails is the *same* set next tick: eight sessions
+that cannot be archived at all — an archive path occupied by something else, a
+body over the format limit — exhaust the attempt budget on every tick forever,
+and nothing older is ever reached. So the pass reports which sessions failed, and
+the sweep holds each one back for a doubling cooldown (capped at an hour, and
+forgotten after two). A broken session costs one attempt and then gets out of the
+way; a transient failure is retried within a tick or two. A hand-run `goxray
+archive` defers nothing — someone who asked for it wants everything tried now.
 
 ### Finding an archive: no index, just a name
 

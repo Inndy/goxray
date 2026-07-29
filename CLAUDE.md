@@ -72,7 +72,9 @@ is a bug even if every test passes.
    live file before unlinking anything — and refuses to install a replacement
    that would drop a ref the current archive holds. Blob reads try `.zst` before
    the archive, so the overlap window and `--unarchive` are correct by
-   construction.
+   construction. Two passes must never overlap: the lock carries an ownership
+   token, is refreshed while held, and is re-read before every install and every
+   unlink, so a pass that lost it stops rather than racing its successor.
 8. **An archive is self-contained.** Nothing in one references anything outside
    it: no shared dictionary, no global chunk pool, no other archive. The store's
    dependency graph stays a forest of depth one, which is why deletion and
@@ -198,6 +200,47 @@ authentication; exposing the port off loopback needs real auth first.
 Verified empirically: 403 for a foreign `Host`, wrong port, or remote `Origin`;
 200 for a loopback `Origin`; zero CORS headers in any response.
 
+### Nothing recorded is trusted as a filename or a length
+
+Both halves of the archive path are attacker-shaped data, and both were treating
+it as ours:
+
+- **A session id comes from the request body**, and the proxy port — unlike the
+  dashboard — has no `Host` guard, so a CORS-simple `POST` from a web page is
+  recorded like anything else. `metadata.session_id` reached `shardPath`
+  verbatim, so `"../../../outsideAA"` escaped `ArchivesDir` and an applied sweep
+  would create or replace a `.gxa` file outside the store.
+
+  It is normalized **once, in `PersistRequest`** — the single place a session id
+  enters the store — and not at each use. uuids pass through unchanged, so the
+  archive filename stays the session id: readable, reversible, and needing no
+  mapping in `--unarchive` or `fsck`. Anything else becomes `h-<digest>`, which
+  keeps distinct sessions distinct and keeps `IsSubagent`'s `sid == ""` test
+  meaning what it says. The raw value is still in the recorded body.
+
+  `archiveFile` is then the only place a session id becomes a path, and it
+  refuses ids that are not names — manifests written before the boundary existed
+  still hold raw ones, and `migrate-usage` preserves them. Such a session is
+  skipped, not mapped: nothing may quietly file a body somewhere the reader
+  won't look for it. Refs restored by `--unarchive` are checked the same way;
+  they come out of an archive's ref table, i.e. off disk.
+
+  The corollary is that an archive file can exist that no session id resolves to
+  — one written before the boundary existed, or moved by hand. `fsck` names it
+  and does **not** credit its refs, so the manifests pointing into it report as
+  unreadable instead of passing clean; `--unarchive` works from the files on disk
+  rather than from session ids, so it is the way back out. Recovery is driven by
+  a directory listing, never by an id off a manifest, which is what keeps the
+  escape closed.
+- **An archive header is a file, and files rot.** Every count and offset in it
+  was allocated on trust; a flipped `nrefs` asked for a four-billion-entry map
+  and OOM-killed whatever process read it, `fsck` included. Everything is now
+  bounded by the file size and by limits the builder also enforces, so a limit
+  can only reject a file goxray did not write.
+
+The general shape: `fsck` exists because stored bytes can be wrong, so no code
+path may need them to be right in order to fail safely.
+
 ### Small ones worth remembering
 
 - `Session.Sources` is always `[]string{}`, never nil — a Go nil slice marshals
@@ -250,6 +293,23 @@ Verified empirically: 403 for a foreign `Host`, wrong port, or remote `Origin`;
   `signature`. The block is faithfully empty, but the timeline should say
   "thinking not disclosed" rather than leave a silent gap.
 - **No auth on the dashboard**, by design. Loopback only.
+- **The archive lock is a lease, not a lock — accepted knowingly.** `O_EXCL` plus
+  an owner token, refreshed every 30 s, stealable after 5 minutes of silence.
+  Every destructive step re-reads the token and the install re-stats its target,
+  which narrows the loss window to the microseconds between the last check and
+  the rename; a holder suspended past the TTL and then resumed can still land in
+  it. Closing it properly means a real file lock — `syscall.Flock` on unix,
+  `LockFileEx` (already in the `x/sys` we depend on) on Windows — held on
+  `archives/.lock` for the pass, which would also delete the token, the
+  heartbeat and the TTL. It does **not** require touching `os.Rename`: the lock
+  is on the lock file, not on the archive. Judged not worth it for a risk that
+  needs a process suspended for five minutes mid-pass; `fsck` reports the
+  outcome if it ever happens.
+- **Release the lock in the order `close` then `remove`.** Go opens files on
+  Windows without `FILE_SHARE_DELETE`, so `os.Remove` of a file this process
+  still holds open fails there — removing first left every pass's lock on disk
+  and blocked the next one until the TTL. Same rule as unarchiving, which closes
+  the archive before unlinking it.
 
 ### Deferred features, already seamed for
 
@@ -313,6 +373,15 @@ goxray archive --unarchive --apply   # put it all back, byte for byte
 
 `--archive-after 0` disables the background sweep. A hand-run `archive` and the
 sweep exclude each other through a lock file in `archives/`.
+
+If `fsck` reports an archive as unreadable-by-any-session-id, `goxray archive
+--unarchive --apply` is the recovery: it restores every archive it finds on disk,
+including that one, and the next sweep re-files what it can under a name reads
+resolve to.
+
+A session that fails to archive is logged, left completely alone, and held back
+by the sweep for a doubling cooldown (capped at an hour) so it cannot spend every
+tick's budget. A hand-run `archive` never defers — it retries everything.
 
 **Vite dev proxy needs `changeOrigin: true`** or the guard rejects the
 dev-proxied `Host`. Already set in `ui/vite.config.js`; do not remove it.
