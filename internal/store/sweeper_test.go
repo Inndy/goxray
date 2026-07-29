@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -50,6 +51,101 @@ func TestSweeperMakesProgressInBoundedBatches(t *testing.T) {
 	s.once()
 	if n := countLiveBlobs(t, p.blobs); n != 0 {
 		t.Errorf("%d live blobs remain after three passes", n)
+	}
+}
+
+// A session that cannot be archived at all must not hold the store open. The
+// per-tick budget is spent newest-first, so without a cooldown the same failures
+// would consume it on every tick and nothing older would ever be archived.
+func TestSweeperHoldsBackFailingSessions(t *testing.T) {
+	p := tmpPaths(t)
+	st := openStoreAt(t, p)
+	// Enough failures to exhaust the per-tick attempt budget on their own, plus
+	// one archivable session older than all of them. Recorded first, so it sorts
+	// last: candidates come newest-first.
+	var broken []string
+	recordSession(t, st, "sess-fair-0000-0000-00000000ffff", 2)
+	for i := 0; i < 2*sweepMaxSessions; i++ {
+		sid := fmt.Sprintf("sess-brokn-000-0000-00000000%04d", i)
+		broken = append(broken, sid)
+		recordSession(t, st, sid, 2)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Occupy each broken session's archive path with a directory: the pass builds
+	// and verifies, then cannot install.
+	for _, sid := range broken {
+		blocked := shardPath(p.archives, sid, archiveExt)
+		if err := os.MkdirAll(filepath.Join(blocked, "in-the-way"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-time.Hour)
+		if err := os.Chtimes(blocked, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rd := readerAt(t, p)
+	s := NewSweeper(p.blobs, p.manifests, p.archives, rd, time.Minute)
+	s.opts.Quiet = 0
+
+	s.once()
+	if n := countArchives(t, p.archives); n != 0 {
+		t.Fatalf("first pass wrote %d archives; the failures were supposed to fill its budget", n)
+	}
+	if len(s.deferred) != len(broken) {
+		t.Fatalf("deferred %d sessions after a pass, want the %d that failed", len(s.deferred), len(broken))
+	}
+	for _, sid := range broken {
+		if d := s.deferred[sid]; d.fails != 1 || d.until.Before(time.Now()) {
+			t.Errorf("%s: deferral = %+v, want one failure and a future cooldown", sid, d)
+		}
+	}
+
+	// The next tick must reach the session behind them rather than spend the
+	// budget on the same failures again.
+	s.once()
+	if n := countArchives(t, p.archives); n != 1 {
+		t.Errorf("%d archives after the second pass; the archivable session is still starving", n)
+	}
+	for _, sid := range broken {
+		if d := s.deferred[sid]; d.fails != 1 {
+			t.Errorf("%s was retried while cooling down: %+v", sid, d)
+		}
+	}
+
+	// Once the cooldown expires it is tried again, and fails again — with a
+	// longer cooldown, not a permanent exclusion.
+	for sid, d := range s.deferred {
+		d.until = time.Now().Add(-time.Second)
+		s.deferred[sid] = d
+	}
+	s.once()
+	for _, sid := range broken[:1] {
+		if d := s.deferred[sid]; d.fails != 2 {
+			t.Errorf("%s was not retried after its cooldown: %+v", sid, d)
+		}
+	}
+}
+
+func TestSweeperForgetsAnOldDeferral(t *testing.T) {
+	p := tmpPaths(t)
+	s := NewSweeper(p.blobs, p.manifests, p.archives, nil, time.Minute)
+	now := time.Now()
+	s.deferred["cooling"] = sweepDefer{fails: 1, until: now.Add(time.Minute)}
+	s.deferred["expired"] = sweepDefer{fails: 1, until: now.Add(-time.Minute)}
+	s.deferred["ancient"] = sweepDefer{fails: 9, until: now.Add(-sweepForget - time.Minute)}
+
+	skip := s.holdBack(now)
+	if !skip["cooling"] || skip["expired"] || skip["ancient"] {
+		t.Errorf("holdBack = %v, want only the one still cooling down", skip)
+	}
+	if _, ok := s.deferred["ancient"]; ok {
+		t.Error("a long-cooled session kept its failure count, so its next failure inherits the backoff")
+	}
+	if _, ok := s.deferred["expired"]; !ok {
+		t.Error("a just-expired session was forgotten too early")
 	}
 }
 

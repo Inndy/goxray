@@ -22,6 +22,25 @@ type Sweeper struct {
 	every  time.Duration
 	cancel context.CancelFunc
 	done   chan struct{}
+
+	// deferred holds sessions that failed a recent pass. Only the sweep goroutine
+	// touches it.
+	deferred map[string]sweepDefer
+}
+
+// sweepDefer is how long a session that keeps failing is held back, and how many
+// times in a row it has failed.
+//
+// A per-tick budget alone is not fairness. Candidates come newest-first, so a
+// handful of sessions that fail every pass — an archive path occupied by
+// something else, a permission problem, a body over the format limit — are the
+// same handful every tick, and everything older sits behind them forever. Holding
+// a failure back for twice as long each time means a broken session costs one
+// attempt and then gets out of the way, while a transient failure (a busy disk)
+// is retried within a tick or two.
+type sweepDefer struct {
+	fails int
+	until time.Time
 }
 
 const (
@@ -35,6 +54,13 @@ const (
 	// sweepLiveTurns archives a session that never goes quiet once it has this
 	// many bodies, so a days-long session cannot hold the store open.
 	sweepLiveTurns = 400
+	// sweepMaxDefer caps the doubling, so a session that was broken and then
+	// fixed is retried within the hour without anyone restarting the proxy.
+	sweepMaxDefer = time.Hour
+	// sweepForget drops a cooled-down session from the deferral table, so its
+	// next failure starts the doubling over rather than inheriting a count from
+	// hours ago. It also bounds the table.
+	sweepForget = 2 * time.Hour
 )
 
 // NewSweeper prepares a background archive sweep. quiet is the idle window; a
@@ -51,7 +77,8 @@ func NewSweeper(blobsDir, manifestsDir, archivesDir string, idx exchangeLister, 
 			Max:          sweepMaxSessions,
 			Apply:        true,
 		},
-		every: min(quiet/4, sweepMaxInterval),
+		every:    min(quiet/4, sweepMaxInterval),
+		deferred: map[string]sweepDefer{},
 	}
 }
 
@@ -84,7 +111,11 @@ func (s *Sweeper) run(ctx context.Context) {
 }
 
 func (s *Sweeper) once() {
-	st, err := ArchiveSessions(s.opts)
+	now := time.Now()
+	opts := s.opts
+	opts.Skip = s.holdBack(now)
+
+	st, err := ArchiveSessions(opts)
 	switch {
 	case errors.Is(err, errArchiveLocked):
 		// Someone ran `goxray archive` by hand. Theirs wins; try again next tick.
@@ -97,6 +128,35 @@ func (s *Sweeper) once() {
 		logf("archived %d session(s), %d bodies, %s -> %s",
 			st.Archived, st.Refs, byteSize(st.BytesFrom), byteSize(st.BytesTo))
 	}
+	for _, sid := range st.FailedSessions {
+		d := s.deferred[sid]
+		d.fails++
+		wait := s.every << min(d.fails-1, 8)
+		if wait > sweepMaxDefer || wait <= 0 {
+			wait = sweepMaxDefer
+		}
+		d.until = now.Add(wait)
+		s.deferred[sid] = d
+		logf("archive: %s failed %d time(s); holding it back for %v", sid, d.fails, wait)
+	}
+}
+
+// holdBack is the set of sessions still cooling down after a failure, and prunes
+// the ones that have been quiet long enough to deserve a clean slate.
+func (s *Sweeper) holdBack(now time.Time) map[string]bool {
+	if len(s.deferred) == 0 {
+		return nil
+	}
+	skip := make(map[string]bool, len(s.deferred))
+	for sid, d := range s.deferred {
+		switch {
+		case now.Before(d.until):
+			skip[sid] = true
+		case now.Sub(d.until) > sweepForget:
+			delete(s.deferred, sid)
+		}
+	}
+	return skip
 }
 
 // Stop ends the sweep and waits for an in-flight pass to finish. Safe to call
