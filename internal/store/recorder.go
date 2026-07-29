@@ -121,6 +121,11 @@ func (r *Recorder) PersistRequest(ex *model.Exchange, rawReq []byte) error {
 	path := strings.SplitN(ex.URL, "?", 2)[0]
 	ex.IsNoise = r.parser.IsNoise(ex.Method, path, nil, rawReq)
 	ex.Req = r.parser.ParseRequest(nil, rawReq)
+	// The store's one trust boundary for a session id: it arrives from the
+	// request body and leaves here as something that can be a filename. Doing it
+	// per-parser would repeat it for every provider; doing it at each read would
+	// be a rule to remember. See normalizeSessionID.
+	ex.Req.SessionID = normalizeSessionID(ex.Req.SessionID)
 
 	ref, err := r.blobs.Put(rawReq)
 	if err != nil {

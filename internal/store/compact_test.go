@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -367,6 +368,138 @@ func TestArchiveOnlyRestrictsToNamedSessions(t *testing.T) {
 	}
 }
 
+// A session id arrives in the body of a recorded request, and the proxy port has
+// no Host guard, so it is attacker data in the same sense a filename inside a zip
+// is. Archives are found by name, so an id used verbatim would let one request
+// point an applied sweep at a .gxa path anywhere the process can write. The
+// recorder normalizes it on the way in, which is what keeps every read path
+// downstream free of the question.
+func TestHostileSessionIdIsNormalizedOnTheWayIn(t *testing.T) {
+	p := tmpPaths(t)
+	st := openStoreAt(t, p)
+	const hostile = "../../../outsideAA"
+	reqs, ress, ids := recordSession(t, st, hostile, 3)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing downstream of the recorder ever sees the raw id.
+	rd := readerAt(t, p)
+	ex, err := rd.Manifest(ids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := ex.Req.SessionID
+	if sid == hostile {
+		t.Fatalf("manifest recorded the raw session id %q", sid)
+	}
+	if sid != normalizeSessionID(hostile) || !isPlainToken(sid) {
+		t.Fatalf("recorded session id %q is not a usable name", sid)
+	}
+
+	stats := archiveAt(t, p, nil)
+	if stats.Archived != 1 {
+		t.Fatalf("archived %d sessions, want 1: %+v", stats.Archived, stats)
+	}
+	// shardPath is what the archiver used to be handed the raw id through, so it
+	// still reproduces exactly where the escape landed.
+	if _, err := os.Stat(shardPath(p.archives, hostile, archiveExt)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("an archive landed outside the store: %v", err)
+	}
+	inside := shardPath(p.archives, sid, archiveExt)
+	if _, err := os.Stat(inside); err != nil {
+		t.Errorf("no archive under the recorded session id: %v", err)
+	}
+	if rel, err := filepath.Rel(p.archives, inside); err != nil || strings.HasPrefix(rel, "..") {
+		t.Errorf("archive path %q is not under %q", inside, p.archives)
+	}
+	// Still one session, still readable: normalizing keeps the grouping that
+	// blanking the id would have thrown away.
+	assertBodies(t, p, ids, reqs, ress)
+}
+
+// Manifests written before normalization existed still hold raw ids, and
+// migrate-usage preserves them, so the archiver must refuse to build a path from
+// one rather than assume the boundary caught everything.
+func TestArchiveSkipsASessionIdItCannotFile(t *testing.T) {
+	p := tmpPaths(t)
+	const hostile = "../../../legacyAA"
+
+	blobs, err := newLocalBlobs(p.blobs, p.archives)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := blobs.Put([]byte(`{"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs.Close()
+	ex := &model.Exchange{
+		ID: "019fa301-9d78-77fe-9d3f-1ff62ba44500", CaptureVer: model.CaptureVersion,
+		State: model.StateComplete, StartedAt: time.Now().Add(-time.Hour),
+		Req: model.ReqMeta{SessionID: hostile}, ReqRef: ref,
+	}
+	if err := newLocalManifests(p.manifests).Write(ex); err != nil {
+		t.Fatal(err)
+	}
+	// Opening the store rebuilds the index from the manifests, so the archiver
+	// sees this session exactly as it would see one recorded before the boundary
+	// existed — with a live blob to fold in.
+	if err := openStoreAt(t, p).Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := archiveAt(t, p, nil)
+	if stats.Archived != 0 || stats.Skipped != 0 || stats.Sessions != 0 {
+		t.Errorf("stats = %+v, want the session filed nowhere and not attempted", stats)
+	}
+	// And by id, the way `goxray archive --session` reaches it directly.
+	stats = archiveAt(t, p, func(o *ArchiveOptions) { o.Only = []string{hostile} })
+	if stats.Archived != 0 || stats.Skipped != 1 {
+		t.Errorf("stats = %+v, want the session skipped", stats)
+	}
+	if _, err := os.Stat(shardPath(p.archives, hostile, archiveExt)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("an archive landed outside the store: %v", err)
+	}
+	if _, err := os.Stat(shardPath(p.blobs, ref, ".zst")); err != nil {
+		t.Errorf("the blob was unlinked for a session that was never archived: %v", err)
+	}
+}
+
+func TestNormalizeSessionID(t *testing.T) {
+	const uuid = "af5f1ea9-f08a-4d0b-8709-384a1ee6f0ef"
+	if got := normalizeSessionID(uuid); got != uuid {
+		t.Errorf("normalizeSessionID(uuid) = %q, want it unchanged", got)
+	}
+	if got := normalizeSessionID(""); got != "" {
+		t.Errorf("normalizeSessionID(sessionless) = %q, want empty", got)
+	}
+	seen := map[string]string{}
+	for _, bad := range []string{
+		"../../../outsideAA", "a/b", `a\b`, ".hidden", ".", "..", "trailing.",
+		"nul", "NUL.gxa", "com1", "sess id", strings.Repeat("x", 65), "sess\x00",
+	} {
+		got := normalizeSessionID(bad)
+		if got == bad {
+			t.Errorf("normalizeSessionID(%q) passed it through", bad)
+			continue
+		}
+		if !isPlainToken(got) {
+			t.Errorf("normalizeSessionID(%q) = %q, still not a usable name", bad, got)
+		}
+		// Distinct sessions must stay distinct: sharing a name would put two
+		// sessions in one archive.
+		if prev, dup := seen[got]; dup {
+			t.Errorf("%q and %q both normalize to %q", prev, bad, got)
+		}
+		seen[got] = bad
+		// Re-parsing a body through migrate-usage normalizes it again.
+		if again := normalizeSessionID(got); again != got {
+			t.Errorf("normalizeSessionID is not idempotent: %q -> %q -> %q", bad, got, again)
+		}
+	}
+}
+
 func TestArchiveLockIsExclusive(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".lock")
 	l1, err := acquireArchiveLock(path)
@@ -396,4 +529,144 @@ func TestArchiveLockIsExclusive(t *testing.T) {
 		t.Fatalf("stale lock was not broken: %v", err)
 	}
 	l3.release()
+}
+
+// Taking over an abandoned lock has to be survivable by its previous holder:
+// if that pass is in fact still running, it must neither delete its successor's
+// lock nor go on installing archives and unlinking blobs beside it.
+func TestArchiveLockSurvivesBeingTakenOver(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".lock")
+	first, err := acquireArchiveLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.stillHeld() {
+		t.Fatal("holder does not recognise its own lock")
+	}
+
+	// Age the lock as if the holder had been killed, and let another pass in.
+	old := time.Now().Add(-2 * lockTTL)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	second, err := acquireArchiveLock(path)
+	if err != nil {
+		t.Fatalf("takeover failed: %v", err)
+	}
+	if first.stillHeld() {
+		t.Error("displaced holder still believes it holds the lock")
+	}
+	if !second.stillHeld() {
+		t.Error("new holder does not recognise its own lock")
+	}
+
+	first.release()
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("the displaced holder deleted its successor's lock: %v", err)
+	}
+	second.release()
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the owner left its lock behind: %v", err)
+	}
+}
+
+// The other half of the takeover: a pass that has lost its lock must not
+// install, because its successor may already have archived the same session
+// with turns this one never saw.
+func TestArchiveWithoutTheLockChangesNothing(t *testing.T) {
+	p := tmpPaths(t)
+	st := openStoreAt(t, p)
+	const session = "sess-nolock-0000-000000000009"
+	recordSession(t, st, session, 3)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureDir(p.archives); err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err := acquireArchiveLock(filepath.Join(p.archives, ".lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.release()
+	// Another pass declared this one abandoned and took the lock.
+	if err := os.WriteFile(lock.path, []byte("someone else\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	blobs, err := newLocalBlobs(p.blobs, p.archives)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blobs.Close()
+	o := ArchiveOptions{
+		BlobsDir: p.blobs, ManifestsDir: p.manifests, ArchivesDir: p.archives,
+		Index: readerAt(t, p), Apply: true, lock: lock,
+	}
+	var stats ArchiveStats
+	attempted, err := o.archiveSession(&stats, blobs, newLocalManifests(p.manifests), session)
+	if !errors.Is(err, errArchiveLocked) {
+		t.Fatalf("install without the lock returned %v, want errArchiveLocked", err)
+	}
+	if !attempted {
+		t.Error("a failed install should still count as an attempt")
+	}
+	if stats.Archived != 0 {
+		t.Errorf("reported %d sessions archived after refusing to install", stats.Archived)
+	}
+	if n := countLiveBlobs(t, p.blobs); n != 6 {
+		t.Errorf("%d live blobs left, want all 6: nothing may be deleted without the lock", n)
+	}
+	if _, err := os.Stat(shardPath(p.archives, session, archiveExt)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("an archive was installed without the lock: %v", err)
+	}
+}
+
+// A session that fails to install must not be counted as archived: the CLI's
+// summary and the sweep log are the only places anyone sees what happened, and
+// they were reporting bodies as folded in while the blobs were still live files.
+func TestArchiveDoesNotCountFailuresAsArchived(t *testing.T) {
+	p := tmpPaths(t)
+	st := openStoreAt(t, p)
+	const broken = "sess-broken-0000-000000000010"
+	const fine = "sess-fine-00000-000000000011"
+	recordSession(t, st, broken, 3)
+	recordSession(t, st, fine, 3)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Occupy one session's archive path with a non-empty directory: the pass
+	// builds and verifies, then cannot rename over it. Backdate it so the
+	// candidate scan does not read it as an archive that already covers the
+	// session.
+	blocked := shardPath(p.archives, broken, archiveExt)
+	if err := os.MkdirAll(filepath.Join(blocked, "in-the-way"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(blocked, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := ArchiveSessions(ArchiveOptions{
+		BlobsDir: p.blobs, ManifestsDir: p.manifests, ArchivesDir: p.archives,
+		Index: readerAt(t, p), Apply: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Failed != 1 {
+		t.Errorf("reported %d failures, want 1: %+v", stats.Failed, stats)
+	}
+	if stats.Archived != 1 {
+		t.Errorf("reported %d sessions archived, want only the one that finished: %+v", stats.Archived, stats)
+	}
+	if stats.Refs != 6 {
+		t.Errorf("reported %d bodies folded in, want the 6 of the session that finished", stats.Refs)
+	}
+	if n := countLiveBlobs(t, p.blobs); n != 6 {
+		t.Errorf("%d live blobs left, want the failed session's 6 untouched", n)
+	}
 }

@@ -103,7 +103,10 @@ func (s *localBlobs) Get(session, ref string) ([]byte, error) {
 }
 
 func (s *localBlobs) fromArchive(session, ref string) ([]byte, error) {
-	path := shardPath(s.archives, session, archiveExt)
+	path := archiveFile(s.archives, session)
+	if path == "" {
+		return nil, errNotInArchive
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, err := s.openLocked(path)
