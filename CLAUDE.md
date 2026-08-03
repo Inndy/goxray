@@ -418,10 +418,25 @@ goxray archive --unarchive --apply   # put it all back, byte for byte
 `--archive-after 0` disables the background sweep. A hand-run `archive` and the
 sweep exclude each other through a lock file in `archives/`.
 
-If `fsck` reports an archive as unreadable-by-any-session-id, `goxray archive
---unarchive --apply` is the recovery: it restores every archive it finds on disk,
-including that one, and the next sweep re-files what it can under a name reads
-resolve to.
+**Migrating a store off session-id filenames.** One-time, for any store archived
+before the digest naming. `fsck` reports such archives and names this script;
+until it runs, their bodies read as missing (nothing is lost — the files are
+intact and untouched).
+
+```bash
+python3 tools/migrate-archive-names.py            # dry run
+python3 tools/migrate-archive-names.py --apply    # then: goxray fsck
+```
+
+It moves each archive to its digest path and records the session id — taken from
+the legacy filename, which is where the old naming put it — in the file. Stop
+`serve` first, or the lock check will refuse; every rewrite is verified by
+reparsing it from disk before the original is unlinked.
+
+If `fsck` reports an archive as misfiled and the script cannot place it (two
+archives claiming one session, say), `goxray archive --unarchive --apply` is the
+fallback: it restores every archive it finds on disk, including that one, and the
+next sweep re-files what it can under a name reads resolve to.
 
 A session that fails to archive is logged, left completely alone, and held back
 by the sweep for a doubling cooldown (capped at an hour) so it cannot spend every
