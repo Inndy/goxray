@@ -315,6 +315,21 @@ leaving newer turns live. The next cold rebuild merges them.
    unlink. `Get` tries `.zst` before the archive, so the overlap window serves
    correct bytes either way; a crash mid-unlink leaves duplicates, which are
    harmless and swept later.
+
+   *And nothing may hold the target open while it is renamed over.* Go opens
+   files on Windows without `FILE_SHARE_DELETE`, so there the rename fails with
+   "Access is denied" rather than replacing anything, and both holders are this
+   process's own: `verifyArchive` reads the session's already-archived bodies
+   through `blobs`, which caches the very file about to be replaced, and in
+   `serve` the dashboard's cache keeps the last two archives anyone viewed. The
+   install drops its own (`localBlobs.forget`) and asks the rest of the process
+   to drop its (`ArchiveOptions.Release`, wired to `Store.ReleaseArchive`)
+   immediately before the rename. Without it a resumed session on Windows could
+   never be archived at all: rebuild, verify, fail to install, and the same log
+   line every tick. It is the same rule as the lock's close-before-unlink below,
+   one step earlier. What remains is a race rather than a leak — a dashboard read
+   landing between the release and the rename reopens the archive and costs that
+   session one deferred retry.
 4. **One archiver at a time, across processes.** `serve`'s sweep and a
    hand-run `goxray archive --apply` can otherwise rebuild the same session
    concurrently and unlink each other's inputs. This is the one place the design
@@ -448,7 +463,21 @@ procedure, and it would break blob reads until the rebuild finished).
 Because the path is computed rather than remembered, an archive appearing
 mid-run needs no invalidation. Two archives stay open with their pools decoded
 (`archiveCacheMax`), revalidated with one `stat` before reuse so a rebuild that
-renamed over the path is not served from a stale inode.
+renamed over the path is not served from a stale inode — and dropped outright
+just before such a rebuild is installed, because on Windows a cached handle
+blocks the rename (rule 3 above).
+
+A digest name keeps all of that. What it gives up is a minted name — a uuid per
+archive, say, which would make the filename unconditionally safe without hashing
+anything. That was considered and rejected: a minted name has no relationship to
+the session, so it reintroduces exactly the lookup this section exists to avoid,
+and it costs two further properties. Installing a rebuilt archive stops being one
+atomic rename over a known path and becomes write-new, update-mapping,
+unlink-old, so a crash leaves an orphan file or a dangling entry and something
+has to collect them. And "one session, one archive" stops being structural,
+which is what `verifyArchive`'s refusal to drop a ref the current archive holds
+depends on. Deriving the name from the session costs a digest; not deriving it
+costs a mapping, a GC, and an invariant.
 
 ## Deliberately not done
 

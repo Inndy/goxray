@@ -276,6 +276,120 @@ func TestArchiveRebuildKeepsEarlierTurns(t *testing.T) {
 		append(append([][]byte{}, ress1...), ress2...))
 }
 
+// resumedInstall leaves a store one step from installing over an existing
+// archive: a session archived, then resumed with more turns. It hands back the
+// pass and the blob cache the pass will read through, so a test can inspect what
+// the install left open.
+func resumedInstall(t *testing.T, p testPaths, session string) (ArchiveOptions, *localBlobs) {
+	t.Helper()
+	st := openStoreAt(t, p)
+	recordSession(t, st, session, 3)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	archiveAt(t, p, nil)
+
+	st = openStoreAt(t, p)
+	recordSession(t, st, session, 2)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err := acquireArchiveLock(filepath.Join(p.archives, ".lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { lock.release() })
+	blobs, err := newLocalBlobs(p.blobs, p.archives)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { blobs.Close() })
+	return ArchiveOptions{
+		BlobsDir: p.blobs, ManifestsDir: p.manifests, ArchivesDir: p.archives,
+		Index: readerAt(t, p), Apply: true, lock: lock,
+	}, blobs
+}
+
+// The install renames the new archive over the old one, and the verify pass
+// immediately before it reads this session's already-archived bodies through
+// blobs — which caches the archive it opened, i.e. exactly the file about to be
+// replaced. Go opens files on Windows without FILE_SHARE_DELETE, so that rename
+// fails there with "Access is denied": the sweep rebuilt the session, refused to
+// install it, and logged the same failure every tick forever. Nothing can fail on
+// unix, so what is asserted is the handle rather than the rename.
+func TestArchiveInstallHoldsNoHandleOnItsTarget(t *testing.T) {
+	p := tmpPaths(t)
+	const session = "sess-reinstall-000-00000000012"
+	o, blobs := resumedInstall(t, p, session)
+
+	var stats ArchiveStats
+	if _, err := o.archiveSession(&stats, blobs, newLocalManifests(p.manifests), session); err != nil {
+		t.Fatalf("resume install: %v", err)
+	}
+	if stats.Archived != 1 {
+		t.Fatalf("resume pass archived %d sessions, want 1: %+v", stats.Archived, stats)
+	}
+	final := archiveFile(p.archives, session)
+	for _, a := range blobs.cache {
+		if a.path == final {
+			t.Errorf("the pass still holds %s open after installing over it", filepath.Base(final))
+		}
+	}
+}
+
+// A pass can only close its own cache. In serve the dashboard reads through the
+// store's, which keeps the last two archives it served open, so a session anyone
+// viewed after it was archived could never be re-archived on Windows — the same
+// blocked rename, from a handle the pass has no reach into. Release is the seam
+// that lets the install drop that one too.
+func TestArchiveInstallReleasesAnotherReadersHandle(t *testing.T) {
+	p := tmpPaths(t)
+	const session = "sess-viewed-0000-000000000013"
+	o, blobs := resumedInstall(t, p, session)
+
+	rows, err := readerAt(t, p).Query(Filter{Session: session, IncludeNoise: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var archived string
+	for _, ex := range rows {
+		if _, err := os.Stat(shardPath(p.blobs, ex.ReqRef, ".zst")); errors.Is(err, fs.ErrNotExist) {
+			archived = ex.ReqRef
+			break
+		}
+	}
+	if archived == "" {
+		t.Fatal("no archived body to read: the first pass left every blob live")
+	}
+
+	// What a dashboard detail view does, and what it leaves behind.
+	viewer, err := newLocalBlobs(p.blobs, p.archives)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer viewer.Close()
+	if _, err := viewer.Get(session, archived); err != nil {
+		t.Fatalf("read archived body: %v", err)
+	}
+	if len(viewer.cache) != 1 {
+		t.Fatalf("reading an archived body cached %d archives, want 1", len(viewer.cache))
+	}
+	o.Release = viewer.forget
+
+	var stats ArchiveStats
+	if _, err := o.archiveSession(&stats, blobs, newLocalManifests(p.manifests), session); err != nil {
+		t.Fatalf("resume install: %v", err)
+	}
+	if len(viewer.cache) != 0 {
+		t.Errorf("the install left %d handle(s) open from the other reader", len(viewer.cache))
+	}
+	// The reader must still serve the session after having its handle dropped.
+	if _, err := viewer.Get(session, archived); err != nil {
+		t.Errorf("read after release: %v", err)
+	}
+}
+
 func TestUnarchiveRestoresExactly(t *testing.T) {
 	p := tmpPaths(t)
 	st := openStoreAt(t, p)

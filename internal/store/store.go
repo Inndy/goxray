@@ -55,6 +55,17 @@ func Open(blobsDir, manifestsDir, archivesDir, indexPath string, provider model.
 	return &Store{Blobs: blobs, Manifests: manifests, Index: idx, Recorder: rec}, nil
 }
 
+// ReleaseArchive drops any handle the blob cache holds on one archive file. The
+// background sweep calls it immediately before renaming a rebuilt archive over
+// that path, because on Windows a file this process still has open cannot be
+// renamed over — see ArchiveOptions.Release. Reads reopen it on demand, so the
+// only cost is one pool decode.
+func (s *Store) ReleaseArchive(path string) {
+	if b, ok := s.Blobs.(*localBlobs); ok {
+		b.forget(path)
+	}
+}
+
 // Close drains the recorder then closes the index (marking a clean shutdown).
 func (s *Store) Close() error {
 	s.Recorder.Close()

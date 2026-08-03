@@ -84,6 +84,14 @@ type ArchiveOptions struct {
 	Apply     bool
 	Unarchive bool
 
+	// Release drops any handle the rest of this process holds on an archive that
+	// is about to be replaced — in serve, the store the dashboard reads through,
+	// whose blob cache keeps the two most recently read archives open. Windows
+	// will not rename over a file this process still has open, and a pass can only
+	// close its own cache. nil for a hand-run pass: its Reader answers index
+	// queries and never reads a blob.
+	Release func(archivePath string)
+
 	// lock is the pass's own archive lock, set by ArchiveSessions. Every step
 	// that deletes something re-checks it: see archiveLock.stillHeld.
 	lock *archiveLock
@@ -365,6 +373,19 @@ func (o ArchiveOptions) archiveSession(st *ArchiveStats, blobs *localBlobs, mani
 	}
 	if !o.lock.stillHeld() {
 		return true, errArchiveLocked
+	}
+
+	// The rename replaces a file this process may still have open, and Go opens
+	// files on Windows without FILE_SHARE_DELETE: an open handle makes it fail
+	// with "Access is denied" rather than replacing anything, so the session is
+	// rebuilt, verified, refused, and back again every sweep. Two holders, both
+	// this process's own: verifyArchive read the already-archived bodies through
+	// blobs, which caches the archive it opened, and in serve the dashboard's
+	// cache holds up to two more. Same rule as unarchiving's close-before-unlink,
+	// one step earlier.
+	blobs.forget(final)
+	if o.Release != nil {
+		o.Release(final)
 	}
 	if err := os.Rename(tmp, final); err != nil {
 		return true, err

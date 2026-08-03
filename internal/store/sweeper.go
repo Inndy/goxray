@@ -82,6 +82,15 @@ func NewSweeper(blobsDir, manifestsDir, archivesDir string, idx exchangeLister, 
 	}
 }
 
+// ReleaseWith registers the process's other archive-reading cache — in serve,
+// the store the dashboard reads through — so an install can drop its handle on
+// the file it is about to replace. Without it, on Windows, a session anyone has
+// viewed since it was archived can never be re-archived: the rename over the
+// open file fails every tick. Call before Start.
+func (s *Sweeper) ReleaseWith(release func(archivePath string)) {
+	s.opts.Release = release
+}
+
 // Start runs the sweep until Stop. It is a no-op when archiving is disabled.
 func (s *Sweeper) Start() {
 	if s == nil || s.opts.Quiet <= 0 {

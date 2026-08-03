@@ -305,11 +305,26 @@ path may need them to be right in order to fail safely.
   is on the lock file, not on the archive. Judged not worth it for a risk that
   needs a process suspended for five minutes mid-pass; `fsck` reports the
   outcome if it ever happens.
-- **Release the lock in the order `close` then `remove`.** Go opens files on
-  Windows without `FILE_SHARE_DELETE`, so `os.Remove` of a file this process
-  still holds open fails there — removing first left every pass's lock on disk
-  and blocked the next one until the TTL. Same rule as unarchiving, which closes
-  the archive before unlinking it.
+- **Never hold a file open that is about to be unlinked or renamed over.** Go
+  opens files on Windows without `FILE_SHARE_DELETE`, so both `os.Remove` and a
+  rename *onto* a path fail there with "Access is denied" while this process has
+  that file open. Three places obey it: the lock is released `close` then
+  `remove` (removing first left every pass's lock on disk and blocked the next
+  one until the TTL); `--unarchive` closes the archive before unlinking it; and
+  the install drops every cached reader on its target before the rename — its
+  own, because `verifyArchive` reads a resumed session's already-archived bodies
+  through `blobs` and so caches the file it is about to replace, and the rest of
+  the process's through `ArchiveOptions.Release` (wired in `serve` to
+  `Store.ReleaseArchive`, since the dashboard's cache keeps the last two archives
+  anyone viewed). Missing that, **on Windows no resumed session could ever be
+  archived**: every sweep rebuilt it, verified it, failed to install it, and
+  logged the same line five minutes later, forever. Nothing here can fail on
+  unix, so both regression tests assert the handle rather than the rename.
+- **A dashboard read can still lose one install a race.** If it lands between the
+  release above and the rename, the archive is reopened and that rename fails. The
+  session is deferred and retried, so it costs a tick rather than the archive;
+  closing it properly would mean holding the blob cache's lock across the install,
+  which is a cross-instance lock for a window of microseconds.
 
 ### Deferred features, already seamed for
 

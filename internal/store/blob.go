@@ -145,6 +145,27 @@ func (s *localBlobs) openLocked(path string) (*archiveReader, error) {
 	return a, nil
 }
 
+// forget closes and drops the cached reader for one archive path, if it is held.
+//
+// Callers about to replace or unlink that file need this: Go opens files on
+// Windows without FILE_SHARE_DELETE, so a rename over a file this process still
+// holds open fails with "Access is denied" instead of replacing it. On unix it
+// only costs the next read of that archive a reopen.
+//
+// openLocked keeps at most one reader per path, so the first match is the only
+// one.
+func (s *localBlobs) forget(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, a := range s.cache {
+		if a.path == path {
+			a.Close()
+			s.cache = append(s.cache[:i], s.cache[i+1:]...)
+			return
+		}
+	}
+}
+
 // Close releases cached archive handles. Safe to call more than once.
 func (s *localBlobs) Close() error {
 	s.mu.Lock()

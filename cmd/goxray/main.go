@@ -68,6 +68,10 @@ func serve(args []string) error {
 	// it cannot affect the fail-closed guarantee.
 	sweeper := store.NewSweeper(cfg.BlobsDir(), cfg.ManifestsDir(), cfg.ArchivesDir(),
 		st.Index, cfg.ArchiveAfter)
+	// A rebuilt archive is installed by renaming over the old file, which Windows
+	// refuses while this process still holds that file open — as the dashboard's
+	// blob cache does for the last two archives anyone viewed.
+	sweeper.ReleaseWith(st.ReleaseArchive)
 	sweeper.Start()
 	defer sweeper.Stop()
 
