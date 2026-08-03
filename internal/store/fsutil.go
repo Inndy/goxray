@@ -81,24 +81,20 @@ func shardPath(dir, id, ext string) string {
 	return filepath.Join(dir, shard, id+ext)
 }
 
-// normalizeSessionID is applied once, where a session id enters the store, so
-// that everything downstream of the recorder can treat it as a name.
+// normalizeSessionID is applied once, where a session id enters the store.
 //
-// A session id is the one identifier in the store that goxray does not mint. It
-// is whatever the recorded request put in metadata.session_id, and the proxy port
-// has no Host guard, so it is not even reliably the user's own client's — a
-// CORS-simple POST from a web page is recorded like any other request. Archives
-// are found by name rather than through an index, so an id used verbatim as a
-// path component lets that request choose where the archiver writes:
-// "../../../x" resolves clear of ArchivesDir.
+// A session id is the one identifier in the store that goxray does not mint: it
+// is whatever the recorded request put in metadata.session_id, and the proxy
+// port has no Host guard, so it is not even reliably the user's own client's — a
+// CORS-simple POST from a web page is recorded like any other request.
 //
-// Normalizing at the boundary rather than at each use is what makes the property
-// structural: a stored session id *is* a usable name, so no read path has to
-// remember to sanitize one. Real ids are uuids and pass through unchanged, which
-// keeps archive files identifiable by eye and reversible — the filename is the
-// session id. Anything else becomes a digest of itself, prefixed so it is
-// obvious in `goxray ls` that the id was rewritten. The raw value is not lost:
-// it is in the recorded request body, which is stored verbatim.
+// It is no longer what keeps such an id out of the filesystem; archiveFile does
+// that, for every id, by construction. What is left is narrower and not a safety
+// property: a recorded id can be 46 KB of anything, and it is carried in an index
+// column and in the dashboard's URL path. Real ids are uuids and pass through
+// unchanged. Anything else becomes a digest of itself, prefixed so it is obvious
+// in `goxray ls` that the id was rewritten; the raw value is still in the
+// recorded request body, which is stored verbatim.
 //
 // Rewriting rather than blanking keeps two unrelated things honest: distinct
 // sessions stay distinct (a lossy substitution would merge them into one
@@ -112,23 +108,59 @@ func normalizeSessionID(session string) string {
 	return "h-" + hex.EncodeToString(sum[:16])
 }
 
-// archiveFile returns the archive file a session's bodies live in, or "" if the
-// session cannot have one — no session id, or one recorded before
-// normalizeSessionID existed and therefore not usable as a name. The archiver
-// skips such a session and leaves its blobs live; a read reports the body as
-// missing from the archive, which is what it is.
+// archiveNamePrefix marks a filename as one this package derived, so that a file
+// still named after its session — written before the digest naming, or moved by
+// hand — is recognisable as needing migration rather than merely unfamiliar.
+const archiveNamePrefix = "s-"
+
+// archiveName is the filename stem for a session's archive.
+//
+// It is a digest, and the point is that it is *total*: every byte string has
+// exactly one valid name, so nothing about a recorded session id has to be
+// checked, trusted, or rejected before it becomes a path. The predicate this
+// replaces was the whole hazard — it had to be right, it had to be applied at
+// the one boundary that mattered, and the ids it refused could not be archived
+// at all.
+//
+// A digest is only affordable because a session's archive is still found by
+// computing this rather than by consulting a mapping: reads stay index-free and
+// installing a rebuilt archive stays one atomic rename over a known path. What
+// it costs is a filename nobody can read, which the archive pays back by
+// recording its own session id (see archiveReader.Session).
+func archiveName(session string) string {
+	sum := sha256.Sum256([]byte(session))
+	return archiveNamePrefix + hex.EncodeToString(sum[:16])
+}
+
+// isArchiveName reports whether a filename stem is one archiveName produced.
+// Only fsck asks, to tell a pre-migration file from a current one.
+func isArchiveName(stem string) bool {
+	if len(stem) != len(archiveNamePrefix)+32 || !strings.HasPrefix(stem, archiveNamePrefix) {
+		return false
+	}
+	_, err := hex.DecodeString(stem[len(archiveNamePrefix):])
+	return err == nil
+}
+
+// archiveFile returns the archive file a session's bodies live in, or "" for a
+// sessionless turn.
+//
+// The one empty case is about grouping, not safety: a turn with no session id
+// has no locality group to be folded into, and collecting every such turn into
+// one shared file would give the store its first archive that is not per-session
+// — unbounded, rebuilt on every pass, and shared blast radius. They stay live.
 //
 // This is the only place a session id becomes a path.
 func archiveFile(dir, session string) string {
-	if session == "" || !isPlainToken(session) {
+	if session == "" {
 		return ""
 	}
-	return shardPath(dir, session, archiveExt)
+	return shardPath(dir, archiveName(session), archiveExt)
 }
 
 // winReserved are the DOS device names, which Windows still resolves ahead of
-// any file in any directory, extension or not: opening "nul.gxa" opens the null
-// device. Cheap to exclude, and a legitimate session id never looks like one.
+// any file in any directory, extension or not: opening "nul.zst" opens the null
+// device. Cheap to exclude, and a legitimate ref never looks like one.
 var winReserved = map[string]bool{
 	"con": true, "prn": true, "aux": true, "nul": true,
 	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true,

@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -58,12 +59,13 @@ func TestFsckReportsDamage(t *testing.T) {
 	}
 	archiveAt(t, p, nil)
 
-	path := shardPath(p.archives, session, archiveExt)
+	path := archiveFile(p.archives, session)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw[len(raw)-32] ^= 0xff // corrupt the pool
+	// The pool ends where the session trailer begins, not at EOF.
+	raw[len(raw)-len(session)-32] ^= 0xff
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -100,11 +102,11 @@ func TestFsckCatchesAnArchiveFiledUnderTheWrongSession(t *testing.T) {
 	}
 	archiveAt(t, p, nil)
 
-	to := shardPath(p.archives, "sess-elsewhere-00-00000000000b", archiveExt)
+	to := archiveFile(p.archives, "sess-elsewhere-00-00000000000b")
 	if err := ensureDir(filepath.Dir(to)); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(shardPath(p.archives, session, archiveExt), to); err != nil {
+	if err := os.Rename(archiveFile(p.archives, session), to); err != nil {
 		t.Fatal(err)
 	}
 
@@ -132,11 +134,9 @@ func TestFsckCatchesAnArchiveFiledUnderTheWrongSession(t *testing.T) {
 	}
 }
 
-// An archive whose name is not a session id the store resolves to a path is
-// unreachable: every read of it fails. That is the shape a capture from before
-// ids were normalized leaves behind, and the one case where "fsck says clean"
-// would be a lie about data the user still has. It must be named, and it must be
-// recoverable.
+// An archive not at the path its own session resolves to is unreachable: every
+// read of it fails. That is the one case where "fsck says clean" would be a lie
+// about data the user still has. It must be named, and it must be recoverable.
 func TestFsckReportsAnUnreachableArchiveAndUnarchiveRecoversIt(t *testing.T) {
 	p := tmpPaths(t)
 	st := openStoreAt(t, p)
@@ -147,12 +147,12 @@ func TestFsckReportsAnUnreachableArchiveAndUnarchiveRecoversIt(t *testing.T) {
 	}
 	archiveAt(t, p, nil)
 
-	// A space is not a plain token, so no session id can produce this name.
+	// A name no session digests to, in a shard nothing would look in.
 	legacy := filepath.Join(p.archives, "xx", "sess with space"+archiveExt)
 	if err := ensureDir(filepath.Dir(legacy)); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(shardPath(p.archives, session, archiveExt), legacy); err != nil {
+	if err := os.Rename(archiveFile(p.archives, session), legacy); err != nil {
 		t.Fatal(err)
 	}
 
@@ -212,4 +212,91 @@ func TestFsckSessionFilter(t *testing.T) {
 	if got.Manifests != 3 {
 		t.Errorf("cross-checked %d manifests, want 3", got.Manifests)
 	}
+}
+
+// A v2 archive knows its own session, so a misfiled one names the session that
+// would put it right rather than leaving the reader to guess.
+func TestFsckNamesWhereAMisfiledArchiveBelongs(t *testing.T) {
+	p := tmpPaths(t)
+	st := openStoreAt(t, p)
+	const session = "sess-misfiled-00-0000-00000000000c"
+	recordSession(t, st, session, 3)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	archiveAt(t, p, nil)
+
+	home := archiveFile(p.archives, session)
+	away := filepath.Join(p.archives, "zz", "somewhere"+archiveExt)
+	if err := ensureDir(filepath.Dir(away)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(home, away); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := Fsck(FsckOptions{BlobsDir: p.blobs, ManifestsDir: p.manifests, ArchivesDir: p.archives})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Problems) != 1 {
+		t.Fatalf("problems = %v, want the misfiled archive named", got.Problems)
+	}
+	for _, want := range []string{session, "somewhere" + archiveExt, filepath.Base(home)} {
+		if !strings.Contains(got.Problems[0], want) {
+			t.Errorf("problem %q does not mention %q", got.Problems[0], want)
+		}
+	}
+	if len(got.Missing) != 6 {
+		t.Errorf("fsck found %d unreadable bodies, want all 6", len(got.Missing))
+	}
+}
+
+// The pre-migration shape: a readable v1 archive still named after its session.
+// Nothing can read it, and the only useful thing to say is which script fixes it.
+func TestFsckFlagsAPreMigrationArchive(t *testing.T) {
+	p := tmpPaths(t)
+	st := openStoreAt(t, p)
+	const session = "sess-legacy-0000-0000-00000000000d"
+	reqs, ress, ids := recordSession(t, st, session, 3)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	archiveAt(t, p, nil)
+
+	legacy := shardPath(p.archives, session, archiveExt)
+	if err := ensureDir(filepath.Dir(legacy)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(archiveFile(p.archives, session), legacy); err != nil {
+		t.Fatal(err)
+	}
+	downgradeToV1(t, legacy)
+
+	got, err := Fsck(FsckOptions{BlobsDir: p.blobs, ManifestsDir: p.manifests, ArchivesDir: p.archives})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Problems) != 1 || !strings.Contains(got.Problems[0], "migrate-archive-names.py") {
+		t.Fatalf("problems = %v, want one pointing at the migration script", got.Problems)
+	}
+	if got.Chunks == 0 {
+		t.Error("the archive was not verified; whether its bytes survive is the useful part")
+	}
+	if len(got.Missing) != 6 {
+		t.Errorf("fsck found %d unreadable bodies, want all 6", len(got.Missing))
+	}
+
+	// Moving it to where a read looks is enough — a v1 file needs no rewrite to
+	// be readable, which is why the migration can be a script and not a code path.
+	if err := os.Rename(legacy, archiveFile(p.archives, session)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = Fsck(FsckOptions{BlobsDir: p.blobs, ManifestsDir: p.manifests, ArchivesDir: p.archives}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Problems) != 0 || len(got.Missing) != 0 {
+		t.Errorf("a v1 archive at the right path is not clean: %+v", got)
+	}
+	assertBodies(t, p, ids, reqs, ress)
 }

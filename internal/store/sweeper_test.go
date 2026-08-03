@@ -76,7 +76,7 @@ func TestSweeperHoldsBackFailingSessions(t *testing.T) {
 	// Occupy each broken session's archive path with a directory: the pass builds
 	// and verifies, then cannot install.
 	for _, sid := range broken {
-		blocked := shardPath(p.archives, sid, archiveExt)
+		blocked := archiveFile(p.archives, sid)
 		if err := os.MkdirAll(filepath.Join(blocked, "in-the-way"), 0o700); err != nil {
 			t.Fatal(err)
 		}

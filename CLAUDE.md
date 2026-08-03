@@ -81,10 +81,18 @@ is a bug even if every test passes.
    integrity are per-session and there are no refcounts. A resumed session is
    *rebuilt*, never chained onto — measured smaller than chaining, and it keeps
    the graph edge-free.
-9. **`internal/web/dist` is committed on purpose.** It is embedded via
-   `//go:embed all:dist` so `go install` works without Node. Rebuild it (`make
-   ui`) whenever anything under `ui/` changes, or the binary silently ships a
-   stale UI.
+
+9. **An archive is found by computing its name, never by looking it up.**
+   `archiveFile` is `s-<sha256(session id)[:16]>` and nothing maps a session to a
+   file. That is what keeps blob reads working with no `index.db` at all (the
+   documented repricing procedure deletes it), and what makes installing a rebuilt
+   archive exactly one atomic rename over a known path, with "one session, one
+   archive" true structurally rather than by bookkeeping. Do not add a mapping —
+   see the alternatives in [docs/blob-storage.md](docs/blob-storage.md#finding-an-archive-no-index-just-a-name).
+10. **`internal/web/dist` is committed on purpose.** It is embedded via
+    `//go:embed all:dist` so `go install` works without Node. Rebuild it (`make
+    ui`) whenever anything under `ui/` changes, or the binary silently ships a
+    stale UI.
 
 ---
 
@@ -211,27 +219,40 @@ it as ours:
   verbatim, so `"../../../outsideAA"` escaped `ArchivesDir` and an applied sweep
   would create or replace a `.gxa` file outside the store.
 
-  It is normalized **once, in `PersistRequest`** — the single place a session id
-  enters the store — and not at each use. uuids pass through unchanged, so the
-  archive filename stays the session id: readable, reversible, and needing no
-  mapping in `--unarchive` or `fsck`. Anything else becomes `h-<digest>`, which
-  keeps distinct sessions distinct and keeps `IsSubagent`'s `sid == ""` test
-  meaning what it says. The raw value is still in the recorded body.
+  The archive name is now `s-<sha256(session id)[:16]>` — **total**, so no part
+  of a recorded id reaches the path and there is nothing to check, trust, or
+  reject. The escape is not blocked, it is unexpressible. This replaced a
+  working but partial rule (normalize at the boundary, and have `archiveFile`
+  refuse whatever was still not a name), whose real cost was not the check but
+  the leftovers: a session whose id predated the boundary could not be archived
+  at all, and an archive could exist that no session id resolved to. Both are
+  gone. `archiveFile` is total apart from `session == ""`, and that case is about
+  grouping — a sessionless turn has nothing to be folded in with — not safety.
 
-  `archiveFile` is then the only place a session id becomes a path, and it
-  refuses ids that are not names — manifests written before the boundary existed
-  still hold raw ones, and `migrate-usage` preserves them. Such a session is
-  skipped, not mapped: nothing may quietly file a body somewhere the reader
-  won't look for it. Refs restored by `--unarchive` are checked the same way;
-  they come out of an archive's ref table, i.e. off disk.
+  `normalizeSessionID` stays, no longer load-bearing: it bounds a 46 KB id down
+  to something an index column and a dashboard URL can hold, and keeps
+  `IsSubagent`'s `sid == ""` test meaning what it says. Dropping it, and keeping
+  raw ids in the record, is now a free choice rather than a filesystem question.
 
-  The corollary is that an archive file can exist that no session id resolves to
-  — one written before the boundary existed, or moved by hand. `fsck` names it
-  and does **not** credit its refs, so the manifests pointing into it report as
-  unreadable instead of passing clean; `--unarchive` works from the files on disk
-  rather than from session ids, so it is the way back out. Recovery is driven by
-  a directory listing, never by an id off a manifest, which is what keeps the
-  escape closed.
+  Refs restored by `--unarchive` are still checked with `isPlainToken`: they come
+  out of an archive's ref table, i.e. off disk, and unlike a session id a ref is
+  used as a filename directly.
+
+- **An archive records its own session id**, in a trailer at EOF (format v2).
+  A digest filename is not reversible, so without this an archive would be
+  anonymous — and the pre-digest scheme's one real diagnostic, "this file is not
+  where its session would look for it", would have been lost with it. Instead it
+  got better: `fsck` reads the session out of the file, compares it against the
+  path, and for a misfiled archive names where it belongs. A v1 archive has no
+  trailer, still reads, and can only be identified by its filename; `fsck` says
+  so and points at the migration script.
+
+  The trailer is placed after every section, so no offset depends on it. That is
+  deliberate: upgrading a v1 file is an append plus a four-byte header patch, so
+  the migration out of session-id filenames is
+  `tools/migrate-archive-names.py` — a standalone script run once — rather than a
+  compatibility path in the store. `internal/store/migrate_names_test.go` runs
+  the script against a legacy-shaped store and checks `fsck` comes back clean.
 - **An archive header is a file, and files rot.** Every count and offset in it
   was allocated on trust; a flipped `nrefs` asked for a four-billion-entry map
   and OOM-killed whatever process read it, `fsck` included. Everything is now
@@ -252,7 +273,15 @@ path may need them to be right in order to fail safely.
 - Turn rows show the URL only when it is *not* the standard `/v1/messages` call,
   so 97 identical `?beta=true` lines do not drown the list.
 - `internal/view/fixture_test.go` is opt-in via `GOXRAY_VIEW_FIXTURE=<path>` so
-  no real conversation content is ever committed.
+  no real conversation content is ever committed. Same for the two store tests
+  that want a real store, via `GOXRAY_STORE_FIXTURE=<goxray home>`: the archive
+  round-trip and the archive-name migration. Both copy the store to a `t.TempDir()`
+  before touching anything, so they are safe to point at a live `~/.goxray`.
+- Subcommands take no `--home`: `runCLI` calls `config.Load(nil)`, so `goxray ls |
+  show | raw | archive | fsck | migrate-usage` always operate on `~/.goxray`.
+  `--home` only works on `serve`, and `goxray --home X archive` silently *starts a
+  server* (an unrecognised first arg falls through to serve). Point the fixture
+  tests at another store instead.
 
 ---
 

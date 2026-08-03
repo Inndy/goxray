@@ -55,7 +55,7 @@ func conversation(turns int) [][]byte {
 
 func buildArchive(t *testing.T, path string, refs []string, bodies [][]byte) {
 	t.Helper()
-	b, err := newArchiveBuilder()
+	b, err := newArchiveBuilder("s-" + filepath.Base(path))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ func TestArchiveRebuildWithMoreTurns(t *testing.T) {
 }
 
 func TestArchiveBuilderRejectsDuplicateRef(t *testing.T) {
-	b, err := newArchiveBuilder()
+	b, err := newArchiveBuilder("sess")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,5 +301,141 @@ func TestArchiveBuilderRejectsDuplicateRef(t *testing.T) {
 	}
 	if err := b.Add("", []byte("x")); err == nil {
 		t.Error("Add accepted an empty ref")
+	}
+}
+
+// downgradeToV1 rewrites an archive as the format shipped before the session
+// trailer: drop the trailer, put the version back, zero the length field. It is
+// tools/migrate-archive-names.py's upgrade run backwards, and it exists so the
+// reader's v1 support is tested against a file this build did not write.
+func downgradeToV1(t *testing.T, path string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := int(binary.LittleEndian.Uint16(raw[6:]))
+	if n == 0 {
+		t.Fatalf("%s has no session trailer to remove", path)
+	}
+	raw = raw[:len(raw)-n]
+	binary.LittleEndian.PutUint16(raw[4:], 1)
+	binary.LittleEndian.PutUint16(raw[6:], 0)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The session id is in the file, so an archive can say whose it is without
+// anyone reading its filename.
+func TestArchiveRecordsItsSession(t *testing.T) {
+	const session = "af5f1ea9-f08a-4d0b-8709-384a1ee6f0ef"
+	path := filepath.Join(t.TempDir(), "a"+archiveExt)
+	b, err := newArchiveBuilder(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	bodies := conversation(4)
+	for i, body := range bodies {
+		if err := b.Add(fmt.Sprintf("ref-%d", i), body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeFileSync(path, b.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := openArchive(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if a.Session() != session {
+		t.Errorf("archive reports session %q, want %q", a.Session(), session)
+	}
+	// The trailer must not have been counted as part of any section.
+	if _, err := a.Verify(); err != nil {
+		t.Fatal(err)
+	}
+	for i, body := range bodies {
+		got, err := a.Get(fmt.Sprintf("ref-%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Fatalf("body %d came back wrong", i)
+		}
+	}
+}
+
+// A v1 archive is a v2 archive with no trailer: every section is addressed by
+// offset, so nothing about reading one changes except that it cannot say whose
+// session it holds. Upgrading a store must not be a precondition for reading it.
+func TestArchiveReadsV1(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a"+archiveExt)
+	bodies := conversation(6)
+	refs := make([]string, len(bodies))
+	for i := range bodies {
+		refs[i] = fmt.Sprintf("ref-%d", i)
+	}
+	buildArchive(t, path, refs, bodies)
+	downgradeToV1(t, path)
+
+	a, err := openArchive(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if a.Session() != "" {
+		t.Errorf("v1 archive reported session %q", a.Session())
+	}
+	if _, err := a.Verify(); err != nil {
+		t.Fatal(err)
+	}
+	for i, body := range bodies {
+		got, err := a.Get(refs[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Fatalf("body %d came back wrong", i)
+		}
+	}
+}
+
+// The length field was reserved-and-zero in v1, so a v1 file carrying anything
+// there is damage. Believing it would carve live bytes off the end of the pool.
+func TestArchiveRejectsV1WithATrailerLength(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a"+archiveExt)
+	buildArchive(t, path, []string{"a"}, [][]byte{[]byte("hello")})
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint16(raw[4:], 1) // v1 ...
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	} // ... but the trailer length is still set
+	if _, err := openArchive(path); err == nil {
+		t.Error("openArchive accepted a v1 header with a non-zero reserved field")
+	}
+}
+
+// A trailer that claims more bytes than the file holds must be refused before
+// it is subtracted from every section bound.
+func TestArchiveRejectsAnOversizedTrailer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a"+archiveExt)
+	buildArchive(t, path, []string{"a"}, [][]byte{[]byte("hello")})
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint16(raw[6:], uint16(len(raw)))
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openArchive(path); err == nil {
+		t.Error("openArchive accepted a trailer longer than the file")
 	}
 }

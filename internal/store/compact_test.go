@@ -425,7 +425,7 @@ func TestUnarchiveRestoresExactly(t *testing.T) {
 			t.Errorf("restored %s differs from the original file", rel)
 		}
 	}
-	if _, err := os.Stat(shardPath(p.archives, session, archiveExt)); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(archiveFile(p.archives, session)); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("archive survived unarchiving: %v", err)
 	}
 	assertBodies(t, p, ids, reqs, ress)
@@ -474,10 +474,10 @@ func TestArchiveOnlyRestrictsToNamedSessions(t *testing.T) {
 	}
 
 	archiveAt(t, p, func(o *ArchiveOptions) { o.Only = []string{gone} })
-	if _, err := os.Stat(shardPath(p.archives, gone, archiveExt)); err != nil {
+	if _, err := os.Stat(archiveFile(p.archives, gone)); err != nil {
 		t.Errorf("named session was not archived: %v", err)
 	}
-	if _, err := os.Stat(shardPath(p.archives, keep, archiveExt)); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(archiveFile(p.archives, keep)); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("unnamed session was archived anyway: %v", err)
 	}
 }
@@ -520,7 +520,7 @@ func TestHostileSessionIdIsNormalizedOnTheWayIn(t *testing.T) {
 	if _, err := os.Stat(shardPath(p.archives, hostile, archiveExt)); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("an archive landed outside the store: %v", err)
 	}
-	inside := shardPath(p.archives, sid, archiveExt)
+	inside := archiveFile(p.archives, sid)
 	if _, err := os.Stat(inside); err != nil {
 		t.Errorf("no archive under the recorded session id: %v", err)
 	}
@@ -533,9 +533,11 @@ func TestHostileSessionIdIsNormalizedOnTheWayIn(t *testing.T) {
 }
 
 // Manifests written before normalization existed still hold raw ids, and
-// migrate-usage preserves them, so the archiver must refuse to build a path from
-// one rather than assume the boundary caught everything.
-func TestArchiveSkipsASessionIdItCannotFile(t *testing.T) {
+// migrate-usage preserves them. The archiver used to refuse them — a session
+// that could not be filed anywhere kept its blobs live forever. A digest name is
+// defined for every id, so the same manifest now archives like any other, and
+// the escape it used to be capable of is not expressible.
+func TestArchiveFilesARawSessionIdWithoutEscaping(t *testing.T) {
 	p := tmpPaths(t)
 	const hostile = "../../../legacyAA"
 
@@ -564,19 +566,31 @@ func TestArchiveSkipsASessionIdItCannotFile(t *testing.T) {
 	}
 
 	stats := archiveAt(t, p, nil)
-	if stats.Archived != 0 || stats.Skipped != 0 || stats.Sessions != 0 {
-		t.Errorf("stats = %+v, want the session filed nowhere and not attempted", stats)
+	if stats.Archived != 1 {
+		t.Fatalf("stats = %+v, want the session archived", stats)
 	}
-	// And by id, the way `goxray archive --session` reaches it directly.
-	stats = archiveAt(t, p, func(o *ArchiveOptions) { o.Only = []string{hostile} })
-	if stats.Archived != 0 || stats.Skipped != 1 {
-		t.Errorf("stats = %+v, want the session skipped", stats)
-	}
+	// Where the escape used to land: shardPath is what the archiver was handed
+	// the raw id through, and it still resolves clear of ArchivesDir.
 	if _, err := os.Stat(shardPath(p.archives, hostile, archiveExt)); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("an archive landed outside the store: %v", err)
 	}
-	if _, err := os.Stat(shardPath(p.blobs, ref, ".zst")); err != nil {
-		t.Errorf("the blob was unlinked for a session that was never archived: %v", err)
+	inside := archiveFile(p.archives, hostile)
+	if _, err := os.Stat(inside); err != nil {
+		t.Fatalf("no archive for the raw session id: %v", err)
+	}
+	if r, err := filepath.Rel(p.archives, inside); err != nil || strings.HasPrefix(r, "..") {
+		t.Errorf("archive path %q is not under %q", inside, p.archives)
+	}
+	if _, err := os.Stat(shardPath(p.blobs, ref, ".zst")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the live blob outlived a successful archive: %v", err)
+	}
+	// The body is still reachable under the id the manifest actually holds.
+	got, err := readerAt(t, p).Blob(hostile, ref)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != `{"messages":[]}` {
+		t.Errorf("body read back as %q", got)
 	}
 }
 
@@ -732,7 +746,7 @@ func TestArchiveWithoutTheLockChangesNothing(t *testing.T) {
 	if n := countLiveBlobs(t, p.blobs); n != 6 {
 		t.Errorf("%d live blobs left, want all 6: nothing may be deleted without the lock", n)
 	}
-	if _, err := os.Stat(shardPath(p.archives, session, archiveExt)); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(archiveFile(p.archives, session)); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("an archive was installed without the lock: %v", err)
 	}
 }
@@ -755,7 +769,7 @@ func TestArchiveDoesNotCountFailuresAsArchived(t *testing.T) {
 	// builds and verifies, then cannot rename over it. Backdate it so the
 	// candidate scan does not read it as an archive that already covers the
 	// session.
-	blocked := shardPath(p.archives, broken, archiveExt)
+	blocked := archiveFile(p.archives, broken)
 	if err := os.MkdirAll(filepath.Join(blocked, "in-the-way"), 0o700); err != nil {
 		t.Fatal(err)
 	}

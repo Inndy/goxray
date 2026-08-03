@@ -188,12 +188,12 @@ func ArchiveSessions(o ArchiveOptions) (ArchiveStats, error) {
 func (o ArchiveOptions) candidates() ([]string, error) {
 	if o.Unarchive {
 		// Restoring works from the files on disk, not from session ids. An
-		// archive whose name is not a session id the store resolves to a path —
-		// one written before ids were normalized, or moved by hand — is
-		// unreachable through a read, and is precisely the one someone needs to
-		// get back out; `fsck` names it and points here. Taking the name from the
-		// directory keeps that safe: it is a filename that exists in a shard, not
-		// a path built out of a recorded request.
+		// archive no session id resolves to — one still named after its session
+		// because tools/migrate-archive-names.py has not been run, or a file moved
+		// by hand — is unreachable through a read, and is precisely the one
+		// someone needs to get back out; `fsck` names it and points here. Taking
+		// the name from the directory keeps that safe: it is a filename that
+		// exists in a shard, not a path built out of a recorded request.
 		if len(o.Only) > 0 {
 			var out []string
 			for _, sid := range o.Only {
@@ -215,9 +215,8 @@ func (o ArchiveOptions) candidates() ([]string, error) {
 	cutoff := time.Now().Add(-o.Quiet).UnixMilli()
 	var out []string
 	for _, s := range sessions {
-		// A turn with no session id to file an archive under cannot be grouped
-		// into one: the untagged side-turns, a few KB each, plus anything
-		// recorded before ids were normalized. They stay live.
+		// A turn with no session id has no group to be folded into: the untagged
+		// side-turns, a few KB each. They stay live.
 		archive := o.archivePath(s.SessionID)
 		if archive == "" {
 			continue
@@ -279,8 +278,8 @@ type sessionRef struct {
 // what Max budgets — a session that turned out to be already archived did not,
 // and one that failed did.
 func (o ArchiveOptions) archiveSession(st *ArchiveStats, blobs *localBlobs, manifests *localManifests, sid string) (bool, error) {
-	// No file to put it in: a sessionless turn, or one whose id predates
-	// normalization and so is not a name. Both stay live.
+	// No file to put it in: a sessionless turn, which has nothing to group it
+	// with. It stays live.
 	final := o.archivePath(sid)
 	if final == "" {
 		st.Skipped++
@@ -425,7 +424,7 @@ func fileGeneration(path string) (string, error) {
 // Bodies are streamed through the builder one at a time, so peak memory is the
 // session's unique content rather than its total traffic.
 func (o ArchiveOptions) buildArchive(blobs *localBlobs, sid string, refs []sessionRef, final string) (string, int64, error) {
-	b, err := newArchiveBuilder()
+	b, err := newArchiveBuilder(sid)
 	if err != nil {
 		return "", 0, err
 	}

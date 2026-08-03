@@ -99,17 +99,21 @@ There is no chunking, hashing, or dependency on any other object on the hot
 path.
 
 **Archive tier.** When a session has been quiet for a threshold (say 30 min), or
-on an explicit `goxray archive`, its bodies are rewritten into
-`sessions/<sid>/0000.gxa` and the individual `.zst` files are unlinked.
+on an explicit `goxray archive`, its bodies are rewritten into one file and the
+individual `.zst` files are unlinked.
 
 ```
-sessions/<sid>/0000.gxa
-    header       magic, version, chunk count, frame count, turn count
+archives/<shard>/s-<sha256(session id)[:16]>.gxa
+    header       magic, version, session length, chunk/frame/turn counts, offsets
     chunk table  per chunk id: hash16 | frame | offset | length   (zstd'd)
-    pool         solid zstd frame(s) over unique chunk content, first-use order
     recipes      per ref: zstd(delta-varint chunk ids)
-archive-index    derived: ref -> session id.  Rebuildable by scanning archives.
+    frame dir    per frame: offset | compressed length | raw length
+    pool         solid zstd frame(s) over unique chunk content, first-use order
+    session      the session id, at EOF
 ```
+
+No index maps a ref or a session to a file; the path is recomputed on each read
+(see [Finding an archive](#finding-an-archive-no-index-just-a-name)).
 
 **Parameters**, each measured below: gear-hash CDC at **8 KiB average**
 (2 KiB/32 KiB bounds), SHA-256 truncated to 128 bits in the chunk table,
@@ -373,25 +377,36 @@ leaving newer turns live. The next cold rebuild merges them.
    remaining window needs a process stopped for five minutes in the middle of a
    pass.
 
-5. **A session id is not a filename.** `metadata.session_id` is whatever the
-   recorded request said, and finding an archive by name (below) makes it a path.
-   Without a check, `../../../x` as a session id points an applied sweep at a
-   `.gxa` path outside the store.
+5. **A session id never becomes a filename.** `metadata.session_id` is whatever
+   the recorded request said, and finding an archive by name (below) makes it a
+   path. When the name *was* the id, `../../../x` as a session id pointed an
+   applied sweep at a `.gxa` path outside the store.
 
-   Normalized **once, where it enters the store** (`PersistRequest`), rather than
-   at each read: uuids pass through, so the filename remains the session id and
-   nothing downstream has to remember to sanitize one; anything else becomes
-   `h-<digest>`. `archiveFile` is the only place the id becomes a path, and it
-   refuses one that is not a name — pre-boundary manifests still hold raw ids, so
-   those sessions are skipped rather than filed somewhere a reader would not look.
+   The first fix normalized the id once, where it enters the store, and had
+   `archiveFile` refuse anything that was still not a name. That worked, and it
+   cost three things: a predicate that had to be correct, a boundary that had to
+   be the only way in, and a class of session — pre-boundary manifests holding raw
+   ids — that could not be archived at all.
 
-   Which leaves the inverse case: an archive file whose name no session id
-   resolves to, written before the boundary existed or moved by hand. `fsck` names
-   it and withholds its refs from the verified set, so the manifests pointing into
-   it report unreadable rather than clean, and `--unarchive` restores from the
-   files it finds on disk rather than from session ids, so it can reach the file
-   and put the bodies back. Recovery reads a directory; it never takes a path from
-   a manifest.
+   The name is now `s-<sha256(session id)[:16]>`, which is defined for **every**
+   byte string. Nothing about a recorded id is checked, trusted, or rejected
+   before it becomes a path, because no part of it reaches the path. The escape is
+   not blocked; it is not expressible. `archiveFile` is total apart from the empty
+   session, and that one case is about grouping rather than safety: a turn with no
+   session id has nothing to be folded in with.
+
+   The cost is a filename no one can read, which the archive pays back by
+   recording its own session id in a trailer. That is what lets `fsck` check the
+   file against where it is filed and name the session that would put a misfiled
+   one right — a case that used to be diagnosable but not fixable. `--unarchive`
+   still restores from the files it finds on disk rather than from session ids, so
+   recovery reads a directory and never takes a path from a manifest.
+
+   Existing stores are moved by `tools/migrate-archive-names.py`, not by Go. The
+   trailer sits after every section, so no offset depends on it and the upgrade is
+   an append plus a four-byte header patch — small enough to be a script, which is
+   better than a compatibility path the store would carry forever. A v1 archive
+   still reads; it just cannot say whose it is.
 
 6. **Every length in an archive header is checked before it is allocated.** The
    file is the thing whose damage `fsck` exists to find, so it cannot be trusted
@@ -437,8 +452,8 @@ archive` defers nothing — someone who asked for it wants everything tried now.
 ### Finding an archive: no index, just a name
 
 There is no ref → archive index, persisted or otherwise. An archive is found by
-name — `archives/<shard>/<session-id>.gxa`, sharded on the last two characters
-by the same `shardPath` helper blobs and manifests use.
+name — `archives/<shard>/s-<sha256(session id)[:16]>.gxa`, sharded on the last
+two characters by the same `shardPath` helper blobs and manifests use.
 
 That works because every blob read in the tree already holds its
 `*model.Exchange` and therefore its session id: `cmdRaw`, both dashboard detail

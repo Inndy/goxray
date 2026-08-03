@@ -18,10 +18,13 @@ type FsckOptions struct {
 	Session      string // restrict to one session; empty checks everything
 }
 
-// archivedRef is a body proven intact inside one particular session's archive.
+// archivedRef is a body proven intact inside the archive at one particular
+// path. Keyed by path rather than by session id because that is what a read
+// resolves: a body is only reachable if it is in the file archiveFile() names
+// for its session, and an archive that is intact somewhere else is not.
 type archivedRef struct {
-	session string // the archive's own name, which is the session id it holds
-	ref     string
+	path string
+	ref  string
 }
 
 // FsckMissing is a manifest that points at a body nothing can produce.
@@ -63,51 +66,56 @@ func Fsck(o FsckOptions) (FsckStats, error) {
 
 	// Pass 1: verify archives, and remember which refs they hold so the
 	// manifest cross-check does not have to re-decode a pool per manifest.
-	//
-	// Keyed by (session, ref), not by ref alone. A ref proven to be intact
-	// *somewhere* is not the property a manifest needs: reads resolve a body
-	// through its own session's archive path, so an archive moved or renamed
-	// under another session holds refs nothing can reach. Keying globally passed
-	// that store as clean while every read from it failed.
 	archived := map[archivedRef]bool{}
+	only := ""
+	if o.Session != "" {
+		only = archiveFile(o.ArchivesDir, o.Session)
+	}
 	err = filepath.WalkDir(o.ArchivesDir, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil || d.IsDir() || filepath.Ext(p) != archiveExt {
 			return nil //nolint:nilerr // an unreadable shard is reported below, not fatal
 		}
-		sid := d.Name()[:len(d.Name())-len(archiveExt)]
-		if o.Session != "" && sid != o.Session {
+		p = filepath.Clean(p)
+		if only != "" && p != only {
 			return nil
 		}
 		st.Archives++
-		// A read finds an archive by computing archiveFile() from the session id on
-		// the manifest, so a file whose own name does not produce its own path
-		// holds bodies no read can reach: an id recorded before normalization, or a
-		// file moved between shards by hand. Verify it anyway — the bytes are
-		// intact and `--unarchive` can still get them out, which is worth saying —
-		// but do not credit its refs. Crediting them is how a store where every
-		// read failed came out of pass 2 looking clean.
-		reachable := archiveFile(o.ArchivesDir, sid) == filepath.Clean(p)
-		if !reachable {
-			st.Problems = append(st.Problems, fmt.Sprintf(
-				"%s: no session id resolves to this file, so nothing can read it; recover it with `goxray archive --unarchive --apply`", sid))
-		}
+		stem := d.Name()[:len(d.Name())-len(archiveExt)]
+		label := stem
 		a, err := openArchive(p)
 		if err != nil {
-			st.Problems = append(st.Problems, fmt.Sprintf("%s: %v", sid, err))
+			st.Problems = append(st.Problems, fmt.Sprintf("%s: %v", label, err))
 			return nil
 		}
 		defer a.Close()
+		// An archive says whose it is, so it can be checked against where it
+		// is filed — and a file in the wrong place names the session that would
+		// put it right. A v1 archive records no session and predates digest
+		// naming, so the only thing to say about it is that it needs migrating.
+		switch sid := a.Session(); {
+		case sid != "":
+			label = sid
+			if want := archiveFile(o.ArchivesDir, sid); want != p {
+				st.Problems = append(st.Problems, fmt.Sprintf(
+					"%s: filed at %s but belongs at %s, so nothing can read it; `python3 tools/migrate-archive-names.py --apply` moves it",
+					label, relPath(o.ArchivesDir, p), relPath(o.ArchivesDir, want)))
+			}
+		case !isArchiveName(stem):
+			st.Problems = append(st.Problems, fmt.Sprintf(
+				"%s: named after its session, so nothing can read it; `python3 tools/migrate-archive-names.py --apply` migrates it", label))
+		}
 		chunks, err := a.Verify()
 		st.Chunks += chunks
 		if err != nil {
-			st.Problems = append(st.Problems, fmt.Sprintf("%s: %v", sid, err))
+			st.Problems = append(st.Problems, fmt.Sprintf("%s: %v", label, err))
 			return nil
 		}
-		if !reachable {
-			return nil
-		}
+		// Credited by path, whatever the file thinks of itself. Pass 2 asks the
+		// same question a read asks — is the body in the file this session
+		// resolves to — so a misfiled archive is not credited to anyone, and its
+		// manifests report as unreadable rather than passing clean.
 		for _, ref := range a.Refs() {
-			archived[archivedRef{session: sid, ref: ref}] = true
+			archived[archivedRef{path: p, ref: ref}] = true
 			st.Bodies++
 		}
 		return nil
@@ -134,8 +142,9 @@ func Fsck(o FsckOptions) (FsckStats, error) {
 			side string
 			ref  string
 		}{{"request", ex.ReqRef}, {"response", ex.ResRef}}
+		home := archiveFile(o.ArchivesDir, ex.Req.SessionID)
 		for _, c := range check {
-			if c.ref == "" || archived[archivedRef{session: ex.Req.SessionID, ref: c.ref}] {
+			if c.ref == "" || archived[archivedRef{path: home, ref: c.ref}] {
 				continue
 			}
 			if _, err := blobs.Get(ex.Req.SessionID, c.ref); err != nil {
@@ -153,4 +162,13 @@ func Fsck(o FsckOptions) (FsckStats, error) {
 		return st, err
 	}
 	return st, nil
+}
+
+// relPath shortens a path for a message, falling back to the full path when it is
+// not under dir at all.
+func relPath(dir, path string) string {
+	if r, err := filepath.Rel(dir, path); err == nil {
+		return r
+	}
+	return path
 }

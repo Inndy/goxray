@@ -24,7 +24,7 @@ func tmpBlobs(t *testing.T) (*localBlobs, string) {
 // removes the .zst files, the way the compaction pass does.
 func archiveInto(t *testing.T, b *localBlobs, session string, refs []string, bodies [][]byte) {
 	t.Helper()
-	ab, err := newArchiveBuilder()
+	ab, err := newArchiveBuilder(session)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func archiveInto(t *testing.T, b *localBlobs, session string, refs []string, bod
 			t.Fatal(err)
 		}
 	}
-	if err := writeFileSync(shardPath(b.archives, session, archiveExt), ab.Bytes()); err != nil {
+	if err := writeFileSync(archiveFile(b.archives, session), ab.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	for _, ref := range refs {
@@ -201,7 +201,7 @@ func TestGetCorruptArchiveIsNotMistakenForMissing(t *testing.T) {
 	}
 	archiveInto(t, b, session, refs, bodies)
 
-	p := shardPath(b.archives, session, archiveExt)
+	p := archiveFile(b.archives, session)
 	raw, err := os.ReadFile(p)
 	if err != nil {
 		t.Fatal(err)

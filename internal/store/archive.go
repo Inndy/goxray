@@ -36,16 +36,31 @@ import (
 //	refs     zstd( nrefs   × {refLen u16, ref, recipeLen u32, recipe} )
 //	dir      nframes × {off u64, compLen u32, rawLen u32}     (uncompressed)
 //	frames   the pool, one or more zstd frames — the bulk, read lazily
+//	session  the session id, sessionLen bytes, at EOF
 //
 // A recipe is the chunk id sequence of one body, stored as zigzag varint
 // deltas. Consecutive turns reference the same chunks in the same order, so the
 // deltas are mostly small and repetitive; measured, this is 11.4× smaller than
 // storing chunk hashes, which are random bytes and do not compress at all.
+//
+// The session id is a trailer rather than a header field, and its length lives
+// in two bytes v1 reserved and wrote as zero. That is what makes a v1 archive
+// upgradeable in place: no section offset depends on the trailer, so adding one
+// is an append plus a four-byte header patch, not a rewrite. The migration out
+// of session-id filenames is therefore a small standalone script
+// (tools/migrate-archive-names.py) instead of a code path this package has to
+// carry forever.
 const (
 	archiveMagic     = "GXA1"
-	archiveVersion   = 1
+	archiveVersion   = 2
 	archiveHeaderLen = 56
 	archiveExt       = ".gxa"
+
+	// archiveVersionMin is the oldest format this build reads. A v1 archive is
+	// exactly a v2 archive with no trailer, so reading one costs a version
+	// comparison and nothing else; what it lacks is a record of whose session it
+	// holds, which is what fsck needs to say where it belongs.
+	archiveVersionMin = 1
 
 	chunkEntryLen = 16 + 4 + 4 + 4
 	frameDirLen   = 8 + 4 + 4
@@ -80,6 +95,10 @@ const (
 	// archiveMaxBody is one reassembled body. Bodies are HTTP request and
 	// response bodies; the largest in this store is under 10 MiB.
 	archiveMaxBody = 256 << 20
+	// archiveMaxSession bounds the session trailer. Well under the u16 the
+	// length field is stored in: a session id is a uuid, and one that is not
+	// still has to have been small enough to arrive in a request.
+	archiveMaxSession = 4096
 )
 
 // errNotInArchive means the archive is intact and simply does not hold this
@@ -107,7 +126,8 @@ type refEntry struct {
 }
 
 type archiveBuilder struct {
-	enc *zstd.Encoder
+	enc     *zstd.Encoder
+	session string
 
 	ids    map[[32]byte]uint32
 	hashes [][16]byte
@@ -122,7 +142,16 @@ type archiveBuilder struct {
 	seen map[string]bool
 }
 
-func newArchiveBuilder() (*archiveBuilder, error) {
+// newArchiveBuilder starts an archive for one session. The session id is
+// recorded in the file so that the archive says whose it is, rather than being
+// identifiable only by where it happens to be filed.
+func newArchiveBuilder(session string) (*archiveBuilder, error) {
+	if session == "" {
+		return nil, errors.New("archive: empty session id")
+	}
+	if len(session) > archiveMaxSession {
+		return nil, fmt.Errorf("archive: session id is %d bytes, over the %d-byte limit", len(session), archiveMaxSession)
+	}
 	enc, err := zstd.NewWriter(nil,
 		zstd.WithEncoderLevel(zstd.SpeedBestCompression),
 		zstd.WithEncoderConcurrency(1),
@@ -130,7 +159,10 @@ func newArchiveBuilder() (*archiveBuilder, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &archiveBuilder{enc: enc, ids: map[[32]byte]uint32{}, seen: map[string]bool{}}, nil
+	return &archiveBuilder{
+		enc: enc, session: session,
+		ids: map[[32]byte]uint32{}, seen: map[string]bool{},
+	}, nil
 }
 
 func (b *archiveBuilder) Close() {
@@ -230,7 +262,7 @@ func (b *archiveBuilder) Bytes() []byte {
 	out := make([]byte, 0, int(framesOff))
 	out = append(out, archiveMagic...)
 	out = binary.LittleEndian.AppendUint16(out, archiveVersion)
-	out = binary.LittleEndian.AppendUint16(out, 0) // flags, reserved
+	out = binary.LittleEndian.AppendUint16(out, uint16(len(b.session)))
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(b.locs)))
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(b.frames)))
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(b.refs)))
@@ -256,7 +288,7 @@ func (b *archiveBuilder) Bytes() []byte {
 	for _, f := range b.frames {
 		out = append(out, f...)
 	}
-	return out
+	return append(out, b.session...)
 }
 
 // ---------- reading ----------
@@ -267,6 +299,7 @@ type archiveReader struct {
 	dec     *zstd.Decoder
 	modTime int64
 	size    int64
+	session string
 
 	locs   []chunkLoc
 	hashes [][16]byte
@@ -297,9 +330,18 @@ func openArchive(path string) (*archiveReader, error) {
 		f.Close()
 		return nil, fmt.Errorf("archive %s: bad magic %q", path, hdr[:4])
 	}
-	if v := binary.LittleEndian.Uint16(hdr[4:]); v != archiveVersion {
+	version := binary.LittleEndian.Uint16(hdr[4:])
+	if version < archiveVersionMin || version > archiveVersion {
 		f.Close()
-		return nil, fmt.Errorf("archive %s: unsupported version %d", path, v)
+		return nil, fmt.Errorf("archive %s: unsupported version %d", path, version)
+	}
+	// v1 reserved these two bytes and wrote zero. Anything else in a v1 file is
+	// damage, not a trailer, and reading it as a length would carve bytes off
+	// the pool.
+	sessionLen := binary.LittleEndian.Uint16(hdr[6:])
+	if version < 2 && sessionLen != 0 {
+		f.Close()
+		return nil, fmt.Errorf("archive %s: v1 header has %d in its reserved field", path, sessionLen)
 	}
 	nchunks := binary.LittleEndian.Uint32(hdr[8:])
 	nframes := binary.LittleEndian.Uint32(hdr[12:])
@@ -325,6 +367,20 @@ func openArchive(path string) (*archiveReader, error) {
 		return nil, err
 	}
 
+	// The trailer is read first because it is what every other section has to
+	// end before: limit, not the file size, is EOF for the rest of the format.
+	limit := a.size - int64(sessionLen)
+	if limit < archiveHeaderLen {
+		return fail(fmt.Errorf("archive %s: %d-byte session trailer does not fit in %d bytes", path, sessionLen, a.size))
+	}
+	if sessionLen > 0 {
+		buf := make([]byte, sessionLen)
+		if _, err := f.ReadAt(buf, limit); err != nil {
+			return fail(fmt.Errorf("archive %s: read session: %w", path, err))
+		}
+		a.session = string(buf)
+	}
+
 	// Nothing below allocates on a length the file has not been shown to hold.
 	// The arithmetic is deliberately overflow-free: off is 64-bit and off+n would
 	// wrap for a corrupt header, which is exactly the input this guards against.
@@ -332,7 +388,7 @@ func openArchive(path string) (*archiveReader, error) {
 		if n == 0 {
 			return nil, nil
 		}
-		if off < archiveHeaderLen || off > uint64(a.size) || uint64(n) > uint64(a.size)-off {
+		if off < archiveHeaderLen || off > uint64(limit) || uint64(n) > uint64(limit)-off {
 			return nil, fmt.Errorf("archive %s: %s section past EOF", path, what)
 		}
 		buf := make([]byte, n)
@@ -362,7 +418,7 @@ func openArchive(path string) (*archiveReader, error) {
 			compLen: binary.LittleEndian.Uint32(e[8:]),
 			rawLen:  binary.LittleEndian.Uint32(e[12:]),
 		}
-		if d.off < archiveHeaderLen || d.off > uint64(a.size) || uint64(d.compLen) > uint64(a.size)-d.off {
+		if d.off < archiveHeaderLen || d.off > uint64(limit) || uint64(d.compLen) > uint64(limit)-d.off {
 			return fail(fmt.Errorf("archive %s: frame %d runs past EOF", path, i))
 		}
 		if d.compLen == 0 || d.rawLen == 0 || d.rawLen > archiveMaxFrameRaw {
@@ -473,6 +529,10 @@ func (a *archiveReader) Close() error {
 
 // Refs returns the refs this archive holds, in the order they were added.
 func (a *archiveReader) Refs() []string { return a.order }
+
+// Session returns the session the archive was built for, or "" for a v1 file,
+// which recorded no session id and so can only be identified by its filename.
+func (a *archiveReader) Session() string { return a.session }
 
 // Has reports whether the archive holds a ref, without materialising anything.
 func (a *archiveReader) Has(ref string) bool {
