@@ -6,7 +6,7 @@ import SessionList from '@/components/SessionList.vue'
 import TurnList from '@/components/TurnList.vue'
 import TurnDetail from '@/components/TurnDetail.vue'
 import {
-  ctxWindowFor,
+  ctxWindowOf,
   gaps,
   init,
   selectExchange,
@@ -99,7 +99,7 @@ const onTurn = (id) => pushSelection(store.selectedSession, id)
                 :turn-numbers="turnNumbers"
                 :gaps="gaps"
                 :loading="store.loadingList"
-                :ctx-window-for="ctxWindowFor"
+                :ctx-window-of="ctxWindowOf"
                 @select="onTurn"
               />
             </template>

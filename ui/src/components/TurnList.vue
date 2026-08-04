@@ -20,7 +20,7 @@ const props = defineProps({
   turnNumbers: { type: Object, required: true },
   gaps: { type: Object, required: true },
   loading: { type: Boolean, default: false },
-  ctxWindowFor: { type: Function, required: true },
+  ctxWindowOf: { type: Function, required: true },
 })
 const emit = defineEmits(['select'])
 
@@ -35,7 +35,6 @@ const title = (ex) => {
   if (ex.url && !STD_ROUTE.test(ex.url)) return ex.url
   return ''
 }
-const sid = (ex) => ex.req?.session_id || ''
 </script>
 
 <template>
@@ -82,7 +81,7 @@ const sid = (ex) => ex.req?.session_id || ''
 
         <div v-if="title(ex)" class="line2">{{ title(ex) }}</div>
 
-        <CacheBar :usage="ex.res?.usage" :ctx-window="ctxWindowFor(sid(ex), ex.req?.model)" />
+        <CacheBar :usage="ex.res?.usage" :ctx-window="ctxWindowOf(ex)" />
 
         <div class="line4">
           <span v-if="fmtDuration(elapsedMs(ex))" class="mono">{{

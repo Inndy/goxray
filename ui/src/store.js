@@ -14,10 +14,9 @@ const state = reactive({
   loadingList: false,
   loadingDetail: false,
   error: '',
-  // Context window is only derivable from a request body (Claude Code often
-  // omits the [1m] marker from the model field and names it in the system
-  // prompt), so it is learned from loaded details. Rows show a percentage only
-  // once it is known, rather than assuming 200K.
+  // Fallback context windows learned from loaded details, for captures taken
+  // before the window was recorded per turn (`goxray migrate-usage` backfills
+  // those; until it runs, opening one turn is still what lights up its siblings).
   //
   // Keyed by session *and* model, because one session routinely mixes windows:
   // a 1M Opus turn beside a 200K Haiku side-turn. Caching a single window per
@@ -72,7 +71,12 @@ export const gaps = computed(() => {
 
 const ctxKey = (sid, model) => `${sid}|${model || ''}`
 
-export const ctxWindowFor = (sid, model) => state.ctxWindowByModel[ctxKey(sid, model)] || 0
+// The window a turn was working against. Recorded on the turn itself, so a row
+// that has just streamed in already has its denominator — the learned cache is
+// only for records written before that was captured. 0 means unknown, which the
+// bar renders as composition-only rather than assuming 200K.
+export const ctxWindowOf = (ex) =>
+  ex.req?.ctx_window || state.ctxWindowByModel[ctxKey(ex.req?.session_id || '', ex.req?.model)] || 0
 
 // Generation counters guard both list loads the same way selectExchange guards
 // the detail fetch: rapid session/noise switching can leave an older request in

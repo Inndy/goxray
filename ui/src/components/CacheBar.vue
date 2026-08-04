@@ -5,9 +5,9 @@ import { cacheHitPct, ctxUsed, fmtTokens } from '@/lib/format.js'
 
 const props = defineProps({
   usage: { type: Object, default: null },
-  // 0 when unknown. The window is only derivable from a request body, so rows
-  // render composition-only until a detail load reveals it — never assuming a
-  // 200K window, which would show a 1M session at over 100%.
+  // 0 when unknown — a capture taken before the window was recorded per turn.
+  // The bar then shows composition only, rather than assuming a 200K window,
+  // which would render a 1M session at over 100%.
   ctxWindow: { type: Number, default: 0 },
 })
 
@@ -61,7 +61,9 @@ const ctxClass = computed(() => {
         <div class="tip-total">
           used {{ fmtTokens(used) }}<span v-if="ctxWindow"> / {{ fmtTokens(ctxWindow) }}</span>
         </div>
-        <div v-if="!ctxWindow" class="tip-note">window unknown until this turn is opened</div>
+        <div v-if="!ctxWindow" class="tip-note">
+          window not recorded on this turn — open it, or run goxray migrate-usage
+        </div>
       </div>
     </NTooltip>
 
