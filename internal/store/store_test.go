@@ -112,6 +112,9 @@ func TestRecorderFlow(t *testing.T) {
 	if m.Res.Cost <= 0 {
 		t.Errorf("expected nonzero cost, got %v", m.Res.Cost)
 	}
+	if m.Req.CtxWindow != 200_000 {
+		t.Errorf("ctx window = %d, want the 200000 default", m.Req.CtxWindow)
+	}
 
 	// Raw response blob is byte-exact.
 	raw, err := rd.Blob(m.Req.SessionID, m.ResRef)
@@ -129,6 +132,11 @@ func TestRecorderFlow(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].ID != ex.ID {
 		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	// A field the projection drops is invisible until something divides by it —
+	// which is how the context bar lost its denominator before it was a column.
+	if rows[0].Req.CtxWindow != m.Req.CtxWindow {
+		t.Errorf("row ctx window = %d, manifest has %d", rows[0].Req.CtxWindow, m.Req.CtxWindow)
 	}
 }
 

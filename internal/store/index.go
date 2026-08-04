@@ -20,7 +20,7 @@ import (
 
 // schemaVer is bumped whenever the SQLite projection shape changes. On a bump,
 // the index is dropped and rebuilt from manifests — no ALTER/backfill.
-const schemaVer = 1
+const schemaVer = 2
 
 const createSQL = `
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS entries(
   id TEXT PRIMARY KEY, ts INTEGER NOT NULL, capture_ver INTEGER, state TEXT,
   provider TEXT, source TEXT, session TEXT, is_noise INTEGER,
   method TEXT, url TEXT, request_id TEXT,
-  model TEXT, msg_count INT, tool_count INT,
+  model TEXT, msg_count INT, tool_count INT, ctx_window INT,
   input_tokens INT, output_tokens INT, cache_read INT, cache_create INT,
   cost REAL, status INT, stop_reason TEXT, cwd TEXT, is_subagent INT,
   title TEXT, elapsed_ms INT, ratelimit TEXT,
@@ -41,9 +41,9 @@ CREATE INDEX IF NOT EXISTS idx_ts ON entries(ts);`
 const upsertSQL = `
 INSERT OR REPLACE INTO entries(
   id,ts,capture_ver,state,provider,source,session,is_noise,method,url,request_id,
-  model,msg_count,tool_count,input_tokens,output_tokens,cache_read,cache_create,
+  model,msg_count,tool_count,ctx_window,input_tokens,output_tokens,cache_read,cache_create,
   cost,status,stop_reason,cwd,is_subagent,title,elapsed_ms,ratelimit,req_ref,res_ref,parse_ok)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 // Filter narrows a Query. Since is a UnixMilli lower bound (exclusive), used by
 // the dashboard to fetch only what appeared after its last poll.
@@ -197,7 +197,7 @@ func doUpsert(stmt *sql.Stmt, ex *model.Exchange) error {
 		ex.ID, ex.StartedAt.UnixMilli(), ex.CaptureVer, string(ex.State),
 		string(ex.Provider), ex.Source, ex.Req.SessionID, b2i(ex.IsNoise),
 		ex.Method, ex.URL, ex.RequestID(),
-		ex.Req.Model, ex.Req.MsgCount, ex.Req.ToolCount,
+		ex.Req.Model, ex.Req.MsgCount, ex.Req.ToolCount, ex.Req.CtxWindow,
 		ex.Res.Usage.InputTokens, ex.Res.Usage.OutputTokens,
 		ex.Res.Usage.CacheReadTokens, ex.Res.Usage.CacheCreateTokens,
 		ex.Res.Cost, ex.Status, ex.Res.StopReason, ex.Req.Cwd, b2i(ex.Req.IsSubagent),
@@ -220,7 +220,7 @@ func (i *Index) Sessions(f Filter) ([]Session, error) {
 // projection without losing any field the dashboard needs (the earlier list
 // dropped cache_read/cache_create, which the context bar depends on).
 const entryCols = `id,ts,capture_ver,state,provider,source,session,is_noise,method,url,request_id,
-  model,msg_count,tool_count,input_tokens,output_tokens,cache_read,cache_create,
+  model,msg_count,tool_count,ctx_window,input_tokens,output_tokens,cache_read,cache_create,
   cost,status,stop_reason,cwd,is_subagent,title,elapsed_ms,ratelimit,req_ref,res_ref,parse_ok`
 
 func queryEntries(db *sql.DB, f Filter) ([]model.Exchange, error) {
@@ -252,7 +252,7 @@ func scanEntry(rows *sql.Rows) (model.Exchange, error) {
 	if err := rows.Scan(
 		&e.ID, &ts, &e.CaptureVer, &e.State, &e.Provider, &e.Source, &e.Req.SessionID, &isNoise,
 		&e.Method, &e.URL, &reqID,
-		&e.Req.Model, &e.Req.MsgCount, &e.Req.ToolCount,
+		&e.Req.Model, &e.Req.MsgCount, &e.Req.ToolCount, &e.Req.CtxWindow,
 		&e.Res.Usage.InputTokens, &e.Res.Usage.OutputTokens,
 		&e.Res.Usage.CacheReadTokens, &e.Res.Usage.CacheCreateTokens,
 		&e.Res.Cost, &e.Status, &e.Res.StopReason, &e.Req.Cwd, &isSubagent,

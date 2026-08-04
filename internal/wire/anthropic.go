@@ -78,8 +78,31 @@ func (Anthropic) ParseRequest(_ http.Header, body []byte) model.ReqMeta {
 		Cwd:        cwd,
 		MsgCount:   len(req.Messages),
 		ToolCount:  len(req.Tools),
+		CtxWindow:  CtxWindow(req.Model, req.System),
 		IsSubagent: cwd == "" && sid == "", // MVP heuristic: no cwd and no explicit session
 	}
+}
+
+// CtxWindow returns the context window the client is working against.
+//
+// The extended window is marked by a "[1m]" suffix on the model id — but Claude
+// Code often sends a bare id in the request's model field and only names the
+// exact id inside the system prompt, so both are checked. Without the marker,
+// assume the standard 200K.
+//
+// A heuristic, and labeled as one in the UI. Only the system prompt is scanned,
+// never message content, so a tool result echoing an ANSI bold sequence cannot
+// be mistaken for the marker.
+//
+// It lives here, beside ParseRequest, because the marker is a Claude Code
+// convention rather than a property of the model: recording the answer at
+// capture time is the only way a listing can show a context percentage without
+// re-reading the request body.
+func CtxWindow(model string, system json.RawMessage) int {
+	if strings.Contains(model, "[1m]") || strings.Contains(string(system), "[1m]") {
+		return 1_000_000
+	}
+	return 200_000
 }
 
 // extractSessionID: explicit metadata.session_id, else parse out of user_id

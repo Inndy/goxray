@@ -1,6 +1,9 @@
 package wire
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 const cannedSSE = `event: message_start
 data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":2}}}
@@ -42,6 +45,40 @@ func TestParseRequest(t *testing.T) {
 	}
 	if m.IsSubagent {
 		t.Errorf("should not be subagent (has cwd+session)")
+	}
+}
+
+func TestCtxWindow(t *testing.T) {
+	if got := CtxWindow("claude-opus-5[1m]", nil); got != 1_000_000 {
+		t.Errorf("marked model id: got %d, want 1000000", got)
+	}
+	if got := CtxWindow("claude-opus-5", nil); got != 200_000 {
+		t.Errorf("bare model id: got %d, want 200000", got)
+	}
+	// Claude Code frequently sends a bare model id and names the exact one only
+	// inside the system prompt; missing that reports 200K for a 1M session and
+	// makes the context bar read past 100%.
+	sys := json.RawMessage(`[{"type":"text","text":"The exact model ID is claude-opus-5[1m]."}]`)
+	if got := CtxWindow("claude-opus-5", sys); got != 1_000_000 {
+		t.Errorf("marker in system prompt: got %d, want 1000000", got)
+	}
+}
+
+// The window has to be recorded at capture time, because the marker that reveals
+// it lives in the system prompt: a listing has the manifest but not the body.
+func TestParseRequestRecordsCtxWindow(t *testing.T) {
+	p := Anthropic{}
+	body := []byte(`{"model":"claude-opus-5","system":[{"type":"text","text":"The exact model ID is claude-opus-5[1m]."}],"messages":[]}`)
+	if m := p.ParseRequest(nil, body); m.CtxWindow != 1_000_000 {
+		t.Errorf("ctx window = %d, want 1000000", m.CtxWindow)
+	}
+	if m := p.ParseRequest(nil, []byte(`{"model":"claude-haiku-4-5","messages":[]}`)); m.CtxWindow != 200_000 {
+		t.Errorf("ctx window = %d, want 200000", m.CtxWindow)
+	}
+	// An unparseable body has no window to report, and 0 is what the dashboard
+	// reads as "unknown" — a 200K default would be a claim we cannot make.
+	if m := p.ParseRequest(nil, []byte(`{not json`)); m.CtxWindow != 0 {
+		t.Errorf("garbage body: ctx window = %d, want 0", m.CtxWindow)
 	}
 }
 

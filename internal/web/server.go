@@ -216,7 +216,13 @@ func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	d := detail{Exchange: ex, CtxWindow: view.CtxWindow(ex.Req.Model, nil)}
+	// The recorded window is what a listing row shows, so prefer it here too and
+	// let the request body correct it below: a detail view that disagreed with the
+	// row it was opened from would read as one of the two being wrong.
+	d := detail{Exchange: ex, CtxWindow: ex.Req.CtxWindow}
+	if d.CtxWindow == 0 {
+		d.CtxWindow = wire.CtxWindow(ex.Req.Model, nil)
+	}
 
 	if ex.ReqRef == "" {
 		d.Warnings = append(d.Warnings, "request body was not recorded")
@@ -232,7 +238,7 @@ func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		} else {
 			d.System = view.SystemBlocks(req.System)
 			d.CCVersion = view.CCVersion(req.System)
-			d.CtxWindow = view.CtxWindow(ex.Req.Model, req.System)
+			d.CtxWindow = wire.CtxWindow(ex.Req.Model, req.System)
 			d.Messages = req.Messages
 		}
 		d.Tools = view.Tools(body)

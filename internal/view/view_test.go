@@ -239,22 +239,6 @@ func TestTools(t *testing.T) {
 	}
 }
 
-func TestCtxWindow(t *testing.T) {
-	if got := CtxWindow("claude-opus-5[1m]", nil); got != 1_000_000 {
-		t.Errorf("marked model id: got %d, want 1000000", got)
-	}
-	if got := CtxWindow("claude-opus-5", nil); got != 200_000 {
-		t.Errorf("bare model id: got %d, want 200000", got)
-	}
-	// Claude Code frequently sends a bare model id and names the exact one only
-	// inside the system prompt; missing that reports 200K for a 1M session and
-	// makes the context bar read past 100%.
-	sys := json.RawMessage(`[{"type":"text","text":"The exact model ID is claude-opus-5[1m]."}]`)
-	if got := CtxWindow("claude-opus-5", sys); got != 1_000_000 {
-		t.Errorf("marker in system prompt: got %d, want 1000000", got)
-	}
-}
-
 func TestOptionsExcludesContent(t *testing.T) {
 	opts := Options([]byte(reqFixture))
 	for _, k := range []string{"system", "tools", "messages"} {

@@ -212,6 +212,37 @@ func TestExchangeDetail(t *testing.T) {
 	}
 }
 
+// The window is recorded per turn so a listing row has a denominator without
+// fetching a body, and the detail view must agree with the row it was opened
+// from even when the body is gone.
+func TestCtxWindowComesFromTheRecordedTurn(t *testing.T) {
+	rd := newTestReader()
+	rd.rows[0].Req.Model = "claude-opus-5" // bare id: only the record knows the window
+	rd.rows[0].Req.CtxWindow = 1_000_000
+	h := Handler(rd, NewHub(), testPort)
+
+	var list struct {
+		Exchanges []model.Exchange `json:"exchanges"`
+	}
+	w := do(t, h, "GET", "/api/exchanges", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Exchanges) != 1 || list.Exchanges[0].Req.CtxWindow != 1_000_000 {
+		t.Errorf("listing lost the window: %+v", list.Exchanges)
+	}
+
+	delete(rd.blobs, "r1")
+	var d detail
+	w = do(t, h, "GET", "/api/exchange/ex1", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.CtxWindow != 1_000_000 {
+		t.Errorf("ctx_window = %d, want the recorded 1000000 with no request body", d.CtxWindow)
+	}
+}
+
 // A turn's own reply is not in its request, so without the assembled message
 // the newest turn's output would be visible nowhere but the raw bytes.
 func TestExchangeDetailAssemblesTheReply(t *testing.T) {

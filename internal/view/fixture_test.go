@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+
+	"go.inndy.tw/goxray/internal/wire"
 )
 
 // TestAgainstRealCapture runs the derivations over a real recorded request body,
@@ -33,7 +35,7 @@ func TestAgainstRealCapture(t *testing.T) {
 	if len(blocks) == 0 {
 		t.Error("no system blocks derived — the prompt shape likely changed")
 	}
-	t.Logf("cc_version=%q  model=%q  ctx_window=%d", CCVersion(req.System), req.Model, CtxWindow(req.Model, req.System))
+	t.Logf("cc_version=%q  model=%q  ctx_window=%d", CCVersion(req.System), req.Model, wire.CtxWindow(req.Model, req.System))
 	for _, b := range blocks {
 		t.Logf("  %-28s %-9s %6d chars %6d tok", b.Key, b.Owner, b.Chars, b.Tokens)
 	}

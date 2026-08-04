@@ -61,12 +61,19 @@ type Usage struct {
 
 // ReqMeta is best-effort metadata parsed from the request body.
 type ReqMeta struct {
-	Model      string `json:"model"`
-	SessionID  string `json:"session_id"`
-	Cwd        string `json:"cwd"`
-	MsgCount   int    `json:"msg_count"`
-	ToolCount  int    `json:"tool_count"`
-	IsSubagent bool   `json:"is_subagent"`
+	Model     string `json:"model"`
+	SessionID string `json:"session_id"`
+	Cwd       string `json:"cwd"`
+	MsgCount  int    `json:"msg_count"`
+	ToolCount int    `json:"tool_count"`
+	// CtxWindow is the window the client was working against, in tokens. It is
+	// recorded rather than derived on read because the "[1m]" marker that reveals
+	// it usually sits in the system prompt, not in the model id: without this a
+	// listing could only show a context percentage for turns whose request body
+	// had already been fetched. Zero on captures taken before this was recorded —
+	// `goxray migrate-usage` recovers it from the stored request blobs.
+	CtxWindow  int  `json:"ctx_window,omitempty"`
+	IsSubagent bool `json:"is_subagent"`
 }
 
 // ResMeta is best-effort metadata parsed from the response.
