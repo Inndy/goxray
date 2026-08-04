@@ -30,6 +30,7 @@ type ArchiveStats struct {
 	Sessions  int   // sessions considered
 	Archived  int   // sessions written (or that would be, on a dry run)
 	Refs      int   // bodies folded in
+	Manifests int   // manifests folded in (or restored, when unarchiving)
 	Skipped   int   // hot, inflight, unarchivable, deferred, or already done
 	Failed    int   // attempted and did not finish; nothing was deleted for these
 	BytesFrom int64 // live blob bytes the pass removed
@@ -135,7 +136,7 @@ func ArchiveSessions(o ArchiveOptions) (ArchiveStats, error) {
 		return st, err
 	}
 	defer blobs.Close()
-	manifests := newLocalManifests(o.ManifestsDir)
+	manifests := newLocalManifests(o.ManifestsDir, o.ArchivesDir)
 
 	targets, err := o.candidates()
 	if err != nil {
@@ -166,7 +167,7 @@ func ArchiveSessions(o ArchiveOptions) (ArchiveStats, error) {
 		var attempted bool
 		var err error
 		if o.Unarchive {
-			attempted, err = o.unarchiveArchive(&st, blobs, sid)
+			attempted, err = o.unarchiveArchive(&st, blobs, manifests, sid)
 		} else {
 			attempted, err = o.archiveSession(&st, blobs, manifests, sid)
 		}
@@ -226,16 +227,31 @@ func (o ArchiveOptions) candidates() ([]string, error) {
 		if !cold && !crowded {
 			continue
 		}
-		// An archive written after the session's last turn already covers it.
-		// One stat is far cheaper than the query-and-read-manifests it saves,
-		// and it keeps a store full of archived sessions from re-examining all
-		// of them on every sweep.
-		if fi, err := os.Stat(archive); err == nil && fi.ModTime().UnixMilli() > s.LastTS {
+		// Both files written after the session's last turn already cover it. Two
+		// stats are far cheaper than the query-and-read-manifests they save, and
+		// they keep a store full of archived sessions from re-examining all of
+		// them on every sweep.
+		//
+		// Both, not just the archive: a store archived before manifests were
+		// packed has an archive newer than its last turn and no pack at all, and
+		// testing only the archive would leave every one of those manifests loose
+		// forever.
+		if covers(archive, s.LastTS) && covers(mpackFile(o.ArchivesDir, s.SessionID), s.LastTS) {
 			continue
 		}
 		out = append(out, s.SessionID)
 	}
 	return out, nil
+}
+
+// covers reports whether path exists and was written after the given turn
+// timestamp, i.e. whether it already accounts for everything the session has.
+func covers(path string, lastTS int64) bool {
+	if path == "" {
+		return false
+	}
+	fi, err := os.Stat(path)
+	return err == nil && fi.ModTime().UnixMilli() > lastTS
 }
 
 // archivedPaths lists every archive file in the store, reachable by a session id
@@ -267,6 +283,15 @@ type sessionRef struct {
 	live bool // a .zst file exists and may be unlinked once verified
 }
 
+// sessionMan is one manifest eligible for folding in. raw is the stored bytes,
+// wherever they came from: a manifest already packed by an earlier pass has to be
+// carried into the rebuild, or resuming a session would drop it.
+type sessionMan struct {
+	id    string
+	raw   []byte
+	loose bool // a .json file exists and may be unlinked once verified
+}
+
 // archiveSession rebuilds one session's archive from every body it can reach —
 // live files and the existing archive both — then verifies and installs it.
 //
@@ -292,20 +317,33 @@ func (o ArchiveOptions) archiveSession(st *ArchiveStats, blobs *localBlobs, mani
 	cutoff := time.Now().Add(-o.Quiet)
 
 	var refs []sessionRef
+	var mans []sessionMan
 	var bytesFrom int64
 	seen := map[string]bool{}
 	for _, row := range rows {
 		// Manifests are the source of truth; the index row only said where to
 		// look. A manifest still inflight, or written inside the quiet window,
 		// is left alone — the exchange stays live and a later pass folds it in.
-		p := manifests.path(row.ID)
-		fi, err := os.Stat(p)
-		if err != nil || fi.ModTime().After(cutoff) {
-			continue
+		//
+		// A missing loose file is not that case: it means an earlier pass already
+		// packed this manifest, and it is already past every gate a loose one has
+		// to clear. Skipping it here would drop it from the rebuilt archive.
+		loose := false
+		if fi, err := os.Stat(manifests.path(row.ID)); err == nil {
+			if fi.ModTime().After(cutoff) {
+				continue
+			}
+			loose = true
 		}
 		ex, err := manifests.Read(row.ID)
 		if err != nil || ex.State == model.StateInflight {
 			continue
+		}
+		if raw, err := manifests.readRaw(row.ID); err == nil {
+			mans = append(mans, sessionMan{id: row.ID, raw: raw, loose: loose})
+			if loose {
+				bytesFrom += int64(len(raw))
+			}
 		}
 		for _, ref := range []string{ex.ReqRef, ex.ResRef} {
 			if ref == "" || seen[ref] {
@@ -327,9 +365,22 @@ func (o ArchiveOptions) archiveSession(st *ArchiveStats, blobs *localBlobs, mani
 			nLive++
 		}
 	}
-	// Nothing live means the session is already archived — the pass is a no-op
-	// rather than a pointless rewrite, which is what makes it idempotent.
-	if nLive == 0 {
+	nLooseMan := 0
+	for _, m := range mans {
+		if m.loose {
+			nLooseMan++
+		}
+	}
+	// Nothing loose in either tier means the session is already archived — the
+	// pass is a no-op rather than a pointless rewrite, which is what makes it
+	// idempotent.
+	//
+	// Counting loose manifests as work is also what upgrades a store archived
+	// before manifests were packed: its bodies are already folded in, so the
+	// bodies alone would say "done", but nothing ever deleted its manifests, so
+	// they are all still loose and the session gets rebuilt once. No version
+	// check needed.
+	if nLive == 0 && nLooseMan == 0 {
 		st.Skipped++
 		return false, nil
 	}
@@ -340,6 +391,7 @@ func (o ArchiveOptions) archiveSession(st *ArchiveStats, blobs *localBlobs, mani
 	commit := func(bytesTo int64) {
 		st.Archived++
 		st.Refs += len(refs)
+		st.Manifests += nLooseMan
 		st.BytesFrom += bytesFrom
 		st.BytesTo += bytesTo
 	}
@@ -348,27 +400,61 @@ func (o ArchiveOptions) archiveSession(st *ArchiveStats, blobs *localBlobs, mani
 		return true, nil
 	}
 
-	// What the archive being replaced looked like before it was verified against.
-	// Rechecked immediately before the rename, so an archive that changed while
+	// What the two files being replaced looked like before they were verified
+	// against. Rechecked immediately before the renames, so one that changed while
 	// this pass was building — a second pass that added turns this one has never
 	// seen — is not overwritten by a stale snapshot.
+	packPath := mpackFile(o.ArchivesDir, sid)
 	was, err := fileGeneration(final)
 	if err != nil {
 		return true, err
 	}
-	tmp, size, err := o.buildArchive(blobs, sid, refs, final)
+	wasPack, err := fileGeneration(packPath)
 	if err != nil {
 		return true, err
 	}
-	defer os.Remove(tmp) // no-op once renamed
+	// The body archive is rebuilt only when there is something live to fold into
+	// it. With nothing live it already holds every body this session has, so
+	// rewriting it would be pure cost — and would make packing the manifests of a
+	// session whose archive has been damaged or misfiled fail on a body it never
+	// needed to touch.
+	var tmp string
+	var size int64
+	if nLive > 0 {
+		tmp, size, err = o.buildArchive(blobs, sid, refs, final)
+		if err != nil {
+			return true, err
+		}
+		defer os.Remove(tmp) // no-op once renamed
+	}
 
-	if err := o.verifyArchive(blobs, sid, refs, tmp, final); err != nil {
+	tmpPack, packSize, err := o.buildMpack(sid, mans, packPath)
+	if err != nil {
 		return true, err
+	}
+	if tmpPack != "" {
+		defer os.Remove(tmpPack)
+	}
+
+	if tmp != "" {
+		if err := o.verifyArchive(blobs, sid, refs, tmp, final); err != nil {
+			return true, err
+		}
+	}
+	if tmpPack != "" {
+		if err := o.verifyMpack(mans, tmpPack, packPath); err != nil {
+			return true, err
+		}
 	}
 	if now, err := fileGeneration(final); err != nil {
 		return true, err
 	} else if now != was {
 		return true, fmt.Errorf("%s changed while this pass was building; leaving it to the next", filepath.Base(final))
+	}
+	if now, err := fileGeneration(packPath); err != nil {
+		return true, err
+	} else if now != wasPack {
+		return true, fmt.Errorf("%s changed while this pass was building; leaving it to the next", filepath.Base(packPath))
 	}
 	if !o.lock.stillHeld() {
 		return true, errArchiveLocked
@@ -381,19 +467,30 @@ func (o ArchiveOptions) archiveSession(st *ArchiveStats, blobs *localBlobs, mani
 	// this process's own: verifyArchive read the already-archived bodies through
 	// blobs, which caches the archive it opened, and in serve the dashboard's
 	// cache holds up to two more. Same rule as unarchiving's close-before-unlink,
-	// one step earlier.
-	blobs.forget(final)
-	if o.Release != nil {
-		o.Release(final)
+	// one step earlier. The manifest pack needs no equivalent: nothing caches a
+	// pack reader, which is why localManifests opens and closes one per read.
+	if tmp != "" {
+		blobs.forget(final)
+		if o.Release != nil {
+			o.Release(final)
+		}
+		if err := os.Rename(tmp, final); err != nil {
+			return true, err
+		}
 	}
-	if err := os.Rename(tmp, final); err != nil {
-		return true, err
+	// Both files land before anything is deleted. A failure between the two
+	// renames leaves the bodies live and the manifests loose, so the next pass
+	// simply rebuilds both.
+	if tmpPack != "" {
+		if err := os.Rename(tmpPack, packPath); err != nil {
+			return true, err
+		}
 	}
 	if err := fsyncDir(filepath.Dir(final)); err != nil {
 		return true, err
 	}
 
-	// Only now, with the archive durable and proven, do the originals go.
+	// Only now, with both files durable and proven, do the originals go.
 	for _, r := range refs {
 		if !r.live {
 			continue
@@ -402,7 +499,19 @@ func (o ArchiveOptions) archiveSession(st *ArchiveStats, blobs *localBlobs, mani
 			logf("archive %s: unlink %s: %v", sid, r.ref, err)
 		}
 	}
-	commit(size)
+	// Manifests are the audit record, so these are the most consequential
+	// deletions in the store, and they happen only here: after the pack has been
+	// reopened from disk, every manifest byte-compared against it, both renames
+	// done, and the lock rechecked.
+	for _, m := range mans {
+		if !m.loose {
+			continue
+		}
+		if err := os.Remove(manifests.path(m.id)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			logf("archive %s: unlink manifest %s: %v", sid, m.id, err)
+		}
+	}
+	commit(size + packSize)
 	return true, nil
 }
 
@@ -438,13 +547,19 @@ func (o ArchiveOptions) buildArchive(blobs *localBlobs, sid string, refs []sessi
 			return "", 0, err
 		}
 	}
-	data := b.Bytes()
+	return writeTemp(b.Bytes(), final, ".gxa-*")
+}
 
+// writeTemp lands data in a temp file in the directory it will be installed in,
+// fsynced, so that installing it is one atomic rename within a filesystem. Unlike
+// writeFileSync it hands the temp name back rather than renaming, because both
+// callers have to verify the file from disk before it may replace anything.
+func writeTemp(data []byte, final, pattern string) (string, int64, error) {
 	dir := filepath.Dir(final)
 	if err := ensureDir(dir); err != nil {
 		return "", 0, err
 	}
-	f, err := os.CreateTemp(dir, ".gxa-*")
+	f, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		return "", 0, err
 	}
@@ -468,6 +583,64 @@ func (o ArchiveOptions) buildArchive(blobs *localBlobs, sid string, refs []sessi
 		return "", 0, err
 	}
 	return name, int64(len(data)), nil
+}
+
+// buildMpack writes the session's manifest pack to a temp file beside its
+// destination. Returns "" when the session has no manifests to pack at all, which
+// is the sessionless case and nothing else.
+func (o ArchiveOptions) buildMpack(sid string, mans []sessionMan, final string) (string, int64, error) {
+	if len(mans) == 0 {
+		return "", 0, nil
+	}
+	b, err := newMpackBuilder(sid)
+	if err != nil {
+		return "", 0, err
+	}
+	defer b.Close()
+	for _, m := range mans {
+		if err := b.Add(m.id, m.raw); err != nil {
+			return "", 0, err
+		}
+	}
+	return writeTemp(b.Bytes(), final, ".gxm-*")
+}
+
+// verifyMpack reopens the candidate pack from disk and byte-compares every
+// manifest against the bytes the build was given, then refuses a replacement that
+// would drop one the current pack holds. Same discipline as verifyArchive, for the
+// same reason: what follows it deletes the only other copy.
+//
+// The comparison is against the collected bytes rather than a re-read, because
+// re-reading a manifest that an earlier pass already packed would resolve through
+// this same tier and prove nothing.
+func (o ArchiveOptions) verifyMpack(mans []sessionMan, tmp, final string) error {
+	p, err := openMpack(tmp)
+	if err != nil {
+		return fmt.Errorf("verify: %w", err)
+	}
+	defer p.Close()
+
+	for _, m := range mans {
+		got, err := p.Get(m.id)
+		if err != nil {
+			return fmt.Errorf("verify: manifest %s: %w", m.id, err)
+		}
+		if !bytes.Equal(got, m.raw) {
+			return fmt.Errorf("verify: manifest %s: pack holds %d bytes, source has %d", m.id, len(got), len(m.raw))
+		}
+	}
+
+	if old, err := openMpack(final); err == nil {
+		defer old.Close()
+		for _, id := range old.IDs() {
+			if !p.Has(id) {
+				return fmt.Errorf("verify: replacement would drop manifest %s", id)
+			}
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		logf("archive: replacing unreadable manifest pack %s: %v", relPath(o.ArchivesDir, final), err)
+	}
+	return nil
 }
 
 // verifyArchive is the reason this is safe to run against real data: it reopens
@@ -519,7 +692,7 @@ func (o ArchiveOptions) verifyArchive(blobs *localBlobs, sid string, refs []sess
 // session id resolves to can still be restored. Refs are checked before they
 // become filenames (see putRef), which is what keeps reading a name off disk from
 // being a way to write anywhere.
-func (o ArchiveOptions) unarchiveArchive(st *ArchiveStats, blobs *localBlobs, path string) (bool, error) {
+func (o ArchiveOptions) unarchiveArchive(st *ArchiveStats, blobs *localBlobs, manifests *localManifests, path string) (bool, error) {
 	a, err := openArchive(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -529,13 +702,32 @@ func (o ArchiveOptions) unarchiveArchive(st *ArchiveStats, blobs *localBlobs, pa
 		return true, err
 	}
 	refs := a.Refs()
+	// The pack is found from the session the archive records rather than from the
+	// archive's own path, so a misfiled archive still restores its manifests.
+	packPath := mpackFile(o.ArchivesDir, a.Session())
+	var manIDs []string
+	if packPath != "" {
+		if p, err := openMpack(packPath); err == nil {
+			manIDs = p.IDs()
+			p.Close()
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			a.Close()
+			return true, fmt.Errorf("unarchive: %s: %w", relPath(o.ArchivesDir, packPath), err)
+		}
+	}
 	var from int64
 	if fi, err := os.Stat(path); err == nil {
 		from = fi.Size()
 	}
+	if packPath != "" {
+		if fi, err := os.Stat(packPath); err == nil {
+			from += fi.Size()
+		}
+	}
 	commit := func(bytesTo int64) {
 		st.Archived++
 		st.Refs += len(refs)
+		st.Manifests += len(manIDs)
 		st.BytesFrom += from
 		st.BytesTo += bytesTo
 	}
@@ -559,6 +751,37 @@ func (o ArchiveOptions) unarchiveArchive(st *ArchiveStats, blobs *localBlobs, pa
 		}
 		written += n
 	}
+	// Manifests go back as loose files before either file is removed, so a failure
+	// anywhere in here leaves the record intact.
+	if len(manIDs) > 0 {
+		p, err := openMpack(packPath)
+		if err != nil {
+			a.Close()
+			return true, fmt.Errorf("unarchive: %s: %w", relPath(o.ArchivesDir, packPath), err)
+		}
+		for _, id := range manIDs {
+			raw, err := p.Get(id)
+			if err != nil {
+				p.Close()
+				a.Close()
+				return true, fmt.Errorf("unarchive manifest %s: %w", id, err)
+			}
+			// The id came off disk and is about to become a filename, so it gets
+			// the same treatment as a ref (see putRef).
+			if !isPlainToken(id) {
+				p.Close()
+				a.Close()
+				return true, fmt.Errorf("unarchive manifest %q: not a plain token", id)
+			}
+			if err := writeFileSync(manifests.path(id), raw); err != nil {
+				p.Close()
+				a.Close()
+				return true, fmt.Errorf("unarchive manifest %s: %w", id, err)
+			}
+			written += int64(len(raw))
+		}
+		p.Close()
+	}
 	// Close before unlinking: the reader holds the file open, and on Windows an
 	// open handle blocks removal outright.
 	a.Close()
@@ -567,6 +790,14 @@ func (o ArchiveOptions) unarchiveArchive(st *ArchiveStats, blobs *localBlobs, pa
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return true, err
+	}
+	// The pack goes last: its manifests are already back as loose files, so losing
+	// this removal costs a stale duplicate that the next pass folds back in, while
+	// losing it before the loose writes would cost the record.
+	if packPath != "" {
+		if err := os.Remove(packPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return true, err
+		}
 	}
 	if err := fsyncDir(filepath.Dir(path)); err != nil {
 		return true, err

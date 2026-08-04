@@ -41,8 +41,10 @@ type FsckStats struct {
 	Archives  int
 	Chunks    int
 	Bodies    int
+	Packs     int // manifest packs checked
+	Packed    int // manifests resolved out of them
 	Manifests int
-	Problems  []string // archive-level failures
+	Problems  []string // archive- and pack-level failures
 	Missing   []FsckMissing
 }
 
@@ -124,9 +126,54 @@ func Fsck(o FsckOptions) (FsckStats, error) {
 		return st, err
 	}
 
+	// Pass 1b: the same for manifest packs. They are checked separately from the
+	// archives, and are a separate file, because a manifest is the record of what
+	// a body was: sharing a file would mean a damaged pool cost the ability to say
+	// which exchanges it cost.
+	onlyPack := ""
+	if o.Session != "" {
+		onlyPack = mpackFile(o.ArchivesDir, o.Session)
+	}
+	err = filepath.WalkDir(o.ArchivesDir, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil || d.IsDir() || filepath.Ext(p) != mpackExt {
+			return nil //nolint:nilerr // an unreadable shard is reported below, not fatal
+		}
+		p = filepath.Clean(p)
+		if onlyPack != "" && p != onlyPack {
+			return nil
+		}
+		st.Packs++
+		label := d.Name()[:len(d.Name())-len(mpackExt)]
+		pk, err := openMpack(p)
+		if err != nil {
+			st.Problems = append(st.Problems, fmt.Sprintf("%s: %v", label, err))
+			return nil
+		}
+		defer pk.Close()
+		// A pack records whose it is, so being in the wrong place is detectable and
+		// nameable, exactly as for an archive.
+		if sid := pk.Session(); sid != "" {
+			label = sid
+			if want := mpackFile(o.ArchivesDir, sid); want != p {
+				st.Problems = append(st.Problems, fmt.Sprintf(
+					"%s: manifest pack filed at %s but belongs at %s, so nothing can read it",
+					label, relPath(o.ArchivesDir, p), relPath(o.ArchivesDir, want)))
+			}
+		}
+		n, err := pk.Verify()
+		st.Packed += n
+		if err != nil {
+			st.Problems = append(st.Problems, fmt.Sprintf("%s: %v", label, err))
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return st, err
+	}
+
 	// Pass 2: every manifest's bodies must be reachable. A ref already verified
 	// in pass 1 is known good; anything else has to be read to prove it.
-	manifests := newLocalManifests(o.ManifestsDir)
+	manifests := newLocalManifests(o.ManifestsDir, o.ArchivesDir)
 	err = manifests.EachID(func(id string) error {
 		ex, err := manifests.Read(id)
 		if err != nil {

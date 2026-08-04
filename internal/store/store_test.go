@@ -191,7 +191,7 @@ func TestBlobFailureRecordsPersistFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifests := newLocalManifests(filepath.Join(d, "manifests"))
+	manifests := newLocalManifests(filepath.Join(d, "manifests"), "")
 	idx, _, _, err := OpenIndex(filepath.Join(d, "index.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -239,7 +239,7 @@ func TestStoreWritesAfterCloseNoPanic(t *testing.T) {
 }
 
 func TestManifestReadRepricesStoredCost(t *testing.T) {
-	man := newLocalManifests(filepath.Join(t.TempDir(), "manifests"))
+	man := newLocalManifests(filepath.Join(t.TempDir(), "manifests"), "")
 
 	ex := &model.Exchange{
 		ID: "00000000-0000-7000-8000-00000000dd01", State: model.StateComplete,
@@ -299,7 +299,7 @@ func TestManifestReadRepricesStoredCost(t *testing.T) {
 // Manifests written before the field was dropped still carry a cost. Reading one
 // must reprice rather than trust it.
 func TestManifestReadIgnoresLegacyStoredCost(t *testing.T) {
-	man := newLocalManifests(filepath.Join(t.TempDir(), "manifests"))
+	man := newLocalManifests(filepath.Join(t.TempDir(), "manifests"), "")
 	id := "00000000-0000-7000-8000-00000000dd02"
 	legacy := `{"id":"` + id + `","state":"complete","capture_ver":1,` +
 		`"req":{"model":"claude-opus-5"},` +
@@ -326,7 +326,7 @@ func TestRebuildFromManifests(t *testing.T) {
 	manDir := filepath.Join(d, "manifests")
 	idxPath := filepath.Join(d, "index.db")
 
-	man := newLocalManifests(manDir)
+	man := newLocalManifests(manDir, "")
 	// Two manifests written directly (as if by a prior run).
 	for _, id := range []string{"00000000-0000-7000-8000-0000000000aa", "00000000-0000-7000-8000-0000000000bb"} {
 		ex := &model.Exchange{ID: id, Provider: model.ProviderAnthropic, State: model.StateComplete,
@@ -367,7 +367,7 @@ func TestRebuildFromManifests(t *testing.T) {
 
 func TestReconcileStragglers(t *testing.T) {
 	d := t.TempDir()
-	man := newLocalManifests(filepath.Join(d, "manifests"))
+	man := newLocalManifests(filepath.Join(d, "manifests"), "")
 	idx, _, _, err := OpenIndex(filepath.Join(d, "index.db"))
 	if err != nil {
 		t.Fatal(err)

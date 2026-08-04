@@ -324,7 +324,7 @@ func TestArchiveInstallHoldsNoHandleOnItsTarget(t *testing.T) {
 	o, blobs := resumedInstall(t, p, session)
 
 	var stats ArchiveStats
-	if _, err := o.archiveSession(&stats, blobs, newLocalManifests(p.manifests), session); err != nil {
+	if _, err := o.archiveSession(&stats, blobs, newLocalManifests(p.manifests, p.archives), session); err != nil {
 		t.Fatalf("resume install: %v", err)
 	}
 	if stats.Archived != 1 {
@@ -378,7 +378,7 @@ func TestArchiveInstallReleasesAnotherReadersHandle(t *testing.T) {
 	o.Release = viewer.forget
 
 	var stats ArchiveStats
-	if _, err := o.archiveSession(&stats, blobs, newLocalManifests(p.manifests), session); err != nil {
+	if _, err := o.archiveSession(&stats, blobs, newLocalManifests(p.manifests, p.archives), session); err != nil {
 		t.Fatalf("resume install: %v", err)
 	}
 	if len(viewer.cache) != 0 {
@@ -555,7 +555,7 @@ func TestArchiveFilesARawSessionIdWithoutEscaping(t *testing.T) {
 		State: model.StateComplete, StartedAt: time.Now().Add(-time.Hour),
 		Req: model.ReqMeta{SessionID: hostile}, ReqRef: ref,
 	}
-	if err := newLocalManifests(p.manifests).Write(ex); err != nil {
+	if err := newLocalManifests(p.manifests, p.archives).Write(ex); err != nil {
 		t.Fatal(err)
 	}
 	// Opening the store rebuilds the index from the manifests, so the archiver
@@ -733,7 +733,7 @@ func TestArchiveWithoutTheLockChangesNothing(t *testing.T) {
 		Index: readerAt(t, p), Apply: true, lock: lock,
 	}
 	var stats ArchiveStats
-	attempted, err := o.archiveSession(&stats, blobs, newLocalManifests(p.manifests), session)
+	attempted, err := o.archiveSession(&stats, blobs, newLocalManifests(p.manifests, p.archives), session)
 	if !errors.Is(err, errArchiveLocked) {
 		t.Fatalf("install without the lock returned %v, want errArchiveLocked", err)
 	}

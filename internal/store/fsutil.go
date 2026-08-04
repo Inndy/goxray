@@ -158,6 +158,27 @@ func archiveFile(dir, session string) string {
 	return shardPath(dir, archiveName(session), archiveExt)
 }
 
+// mpackNamePrefix distinguishes a manifest pack from the body archive of the same
+// session: both are digests of the same string, so only the prefix and extension
+// tell them apart.
+const mpackNamePrefix = "m-"
+
+// mpackFile returns the file a session's manifests live in, or "" for a
+// sessionless turn — which, having no group to be folded into, keeps its loose
+// manifest for the same reason it keeps its live blobs.
+//
+// It sits beside the session's archive rather than inside it. Manifests are the
+// audit record and the mutable half of the store; sharing a file would make a
+// damaged pool cost the record too, and make `migrate-usage` rewriting one field
+// rebuild the whole body pool. See mpack.go.
+func mpackFile(dir, session string) string {
+	if session == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(session))
+	return shardPath(dir, mpackNamePrefix+hex.EncodeToString(sum[:16]), mpackExt)
+}
+
 // winReserved are the DOS device names, which Windows still resolves ahead of
 // any file in any directory, extension or not: opening "nul.zst" opens the null
 // device. Cheap to exclude, and a legitimate ref never looks like one.

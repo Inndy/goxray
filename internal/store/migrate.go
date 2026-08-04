@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"os"
 	"time"
 
@@ -51,24 +52,31 @@ func MigrateUsage(blobsDir, manifestsDir, archivesDir string, parser wire.WirePa
 		return st, err
 	}
 	defer blobs.Close()
-	manifests := newLocalManifests(manifestsDir)
+	manifests := newLocalManifests(manifestsDir, archivesDir)
 	cutoff := time.Now().Add(-migrateQuiesce)
 
 	err = manifests.EachID(func(id string) error {
 		st.Scanned++
 
-		path := manifests.path(id)
-		fi, err := os.Stat(path)
-		if err != nil {
+		// The quiet window only applies to a loose manifest, because it exists to
+		// avoid catching the recorder's inflight write before the final one lands.
+		// A packed manifest already cleared that window before the sweep folded it
+		// in, so a missing loose file is not a failure here.
+		if fi, err := os.Stat(manifests.path(id)); err == nil {
+			if fi.ModTime().After(cutoff) {
+				st.Skipped++
+				return nil
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
 			st.Failed++
 			return nil
 		}
-		if fi.ModTime().After(cutoff) {
-			st.Skipped++
-			return nil
-		}
 
-		data, err := os.ReadFile(path)
+		// Read the stored bytes, not Read's repriced copy: the idempotence check
+		// below compares this record against the one it would write, and a derived
+		// cost on one side of that comparison would make every manifest look
+		// changed.
+		data, err := manifests.readRaw(id)
 		if err != nil {
 			st.Failed++
 			return nil

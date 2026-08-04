@@ -27,7 +27,10 @@ func TestArchiveFixtureRoundTrip(t *testing.T) {
 
 	p := tmpPaths(t)
 	root := filepath.Dir(p.blobs)
-	for _, sub := range []string{"blobs", "manifests"} {
+	// Archives too, not just the live tier: a store that has been archived keeps
+	// most of its bodies in them, so copying only blobs and manifests leaves every
+	// already-archived body unreadable and the round trip measures nothing.
+	for _, sub := range []string{"blobs", "manifests", "archives"} {
 		if err := copyTree(filepath.Join(src, sub), filepath.Join(root, sub)); err != nil {
 			t.Fatalf("copy %s: %v", sub, err)
 		}
@@ -39,7 +42,7 @@ func TestArchiveFixtureRoundTrip(t *testing.T) {
 	// Rebuild the projection from the copied manifests so the archiver sees a
 	// consistent view regardless of what the source store's WAL held.
 	st := openStoreAt(t, p)
-	if err := st.Index.RebuildFrom(newLocalManifests(p.manifests)); err != nil {
+	if err := st.Index.RebuildFrom(newLocalManifests(p.manifests, p.archives)); err != nil {
 		t.Fatalf("rebuild index: %v", err)
 	}
 	if err := st.Close(); err != nil {
@@ -71,7 +74,8 @@ func TestArchiveFixtureRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fsck: %v", err)
 	}
-	t.Logf("fsck: %d archives, %d chunks, %d bodies, %d manifests", fk.Archives, fk.Chunks, fk.Bodies, fk.Manifests)
+	t.Logf("fsck: %d archives, %d chunks, %d bodies, %d packs, %d packed, %d manifests",
+		fk.Archives, fk.Chunks, fk.Bodies, fk.Packs, fk.Packed, fk.Manifests)
 	for _, pr := range fk.Problems {
 		t.Errorf("fsck problem: %s", pr)
 	}
@@ -104,7 +108,7 @@ func hashAllBodies(t *testing.T, p testPaths) map[string]string {
 	defer rd.Close()
 
 	out := map[string]string{}
-	m := newLocalManifests(p.manifests)
+	m := newLocalManifests(p.manifests, p.archives)
 	if err := m.EachID(func(id string) error {
 		ex, err := m.Read(id)
 		if err != nil {
@@ -122,6 +126,16 @@ func hashAllBodies(t *testing.T, p testPaths) map[string]string {
 			sum := sha256.Sum256(body)
 			out[id+"/"+c.side] = hex.EncodeToString(sum[:])
 		}
+		// The manifest itself, not just the bodies it points at: packing deletes
+		// the loose copy, so this is the only end-to-end proof that the audit
+		// record survives a real store's round trip.
+		raw, err := m.readRaw(id)
+		if err != nil {
+			t.Errorf("read manifest %s: %v", id, err)
+			return nil //nolint:nilerr // reported, not fatal: keep checking the rest
+		}
+		sum := sha256.Sum256(raw)
+		out[id+"/manifest"] = hex.EncodeToString(sum[:])
 		return nil
 	}); err != nil {
 		t.Fatal(err)

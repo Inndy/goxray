@@ -34,7 +34,7 @@ func Open(blobsDir, manifestsDir, archivesDir, indexPath string, provider model.
 	if err != nil {
 		return nil, err
 	}
-	manifests := newLocalManifests(manifestsDir)
+	manifests := newLocalManifests(manifestsDir, archivesDir)
 
 	idx, needRebuild, wasClean, err := OpenIndex(indexPath)
 	if err != nil {

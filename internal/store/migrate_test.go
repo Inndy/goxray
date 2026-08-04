@@ -38,7 +38,7 @@ func TestMigrateUsageBackfillsTTLSplit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	man := newLocalManifests(manDir)
+	man := newLocalManifests(manDir, arcDir)
 	id := "00000000-0000-7000-8000-00000000dd02"
 	// A manifest as an older goxray would have written it: flat cache total only.
 	ex := &model.Exchange{

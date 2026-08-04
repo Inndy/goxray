@@ -245,13 +245,16 @@ func TestMigrateArchiveNamesFixture(t *testing.T) {
 	}
 	p := tmpPaths(t)
 	root := filepath.Dir(p.blobs)
-	for _, sub := range []string{"blobs", "manifests"} {
+	// Archives too, not just the live tier: a store that has been archived keeps
+	// most of its bodies in them, so copying only blobs and manifests leaves every
+	// already-archived body unreadable and the round trip measures nothing.
+	for _, sub := range []string{"blobs", "manifests", "archives"} {
 		if err := copyTree(filepath.Join(src, sub), filepath.Join(root, sub)); err != nil {
 			t.Fatalf("copy %s: %v", sub, err)
 		}
 	}
 	st := openStoreAt(t, p)
-	if err := st.Index.RebuildFrom(newLocalManifests(p.manifests)); err != nil {
+	if err := st.Index.RebuildFrom(newLocalManifests(p.manifests, p.archives)); err != nil {
 		t.Fatalf("rebuild index: %v", err)
 	}
 	if err := st.Close(); err != nil {

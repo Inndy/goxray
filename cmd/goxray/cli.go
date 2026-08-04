@@ -85,8 +85,8 @@ func cmdArchive(cfg *config.Config, rd *store.Reader, args []string) error {
 	if *apply {
 		mode = "applied"
 	}
-	fmt.Printf("%s: %d sessions considered, %d to %s (%d bodies), %d skipped, %d failed\n",
-		mode, st.Sessions, st.Archived, verb, st.Refs, st.Skipped, st.Failed)
+	fmt.Printf("%s: %d sessions considered, %d to %s (%d bodies, %d manifests), %d skipped, %d failed\n",
+		mode, st.Sessions, st.Archived, verb, st.Refs, st.Manifests, st.Skipped, st.Failed)
 	switch {
 	case st.BytesFrom == 0:
 	case *undo && *apply:
@@ -128,6 +128,7 @@ func cmdFsck(cfg *config.Config, rd *store.Reader, args []string) error {
 
 	fmt.Printf("%d archives checked, %d chunks verified, %d bodies resolved\n",
 		st.Archives, st.Chunks, st.Bodies)
+	fmt.Printf("%d manifest packs checked, %d manifests resolved\n", st.Packs, st.Packed)
 	fmt.Printf("%d manifests cross-checked, %d bodies unreadable\n", st.Manifests, len(st.Missing))
 	for _, p := range st.Problems {
 		fmt.Println("  !", p)

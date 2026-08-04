@@ -23,7 +23,7 @@ func OpenReader(blobsDir, manifestsDir, archivesDir, indexPath string) (*Reader,
 	if err != nil {
 		return nil, err
 	}
-	r := &Reader{blobs: blobs, manifests: newLocalManifests(manifestsDir)}
+	r := &Reader{blobs: blobs, manifests: newLocalManifests(manifestsDir, archivesDir)}
 	if _, err := os.Stat(indexPath); err == nil {
 		db, err := sql.Open("sqlite", "file:"+indexPath+"?mode=ro&_pragma=busy_timeout(5000)")
 		if err != nil {
