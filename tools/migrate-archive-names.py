@@ -130,7 +130,15 @@ def upgrade_bytes(raw: bytes, session: str) -> bytes:
 
 
 def fsync_dir(d: Path) -> None:
-    fd = os.open(d, os.O_RDONLY)
+    # The guard has to cover the open, not just the fsync: on Windows it is
+    # os.open of a directory that fails, with EACCES, so a try around the fsync
+    # alone let the error escape and aborted every rewrite. Win32 has no way to
+    # flush a directory at all — see internal/store/fsutil_windows.go, which is
+    # a no-op for the same reason — and NTFS journals the metadata regardless.
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return
     try:
         os.fsync(fd)
     except OSError:
