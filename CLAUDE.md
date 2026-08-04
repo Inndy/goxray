@@ -32,13 +32,24 @@ an API shape change can only null a parsed field (`parse_ok=0`), never lose data
 the writing subcommands `goxray migrate-usage`, `goxray archive`, and
 `goxray fsck`.
 
-**Session archiving (this cycle).** Once a session has been idle for
-`--archive-after` (default 30m), its request and response bodies are folded into
-one self-contained file: content-defined chunks, deduplicated within the
-session, unique chunks compressed as a solid zstd pool. Measured on the real
-store, **131.4 MiB → 4.6 MiB (28.7×)**. The write path is untouched. See
+**Session archiving.** Once a session has been idle for `--archive-after`
+(default 30m), its request and response bodies are folded into one
+self-contained file: content-defined chunks, deduplicated within the session,
+unique chunks compressed as a solid zstd pool. Measured on the real store,
+**131.4 MiB → 4.6 MiB (28.7×)**. The write path is untouched. See
 [docs/blob-storage.md](docs/blob-storage.md) for the measurements behind every
 parameter.
+
+**Manifest packing (this cycle).** The same sweep folds the session's manifests
+into a sibling `m-<digest>.gxm` — a directory of lengths plus one solid zstd frame,
+no chunking — and deletes the loose `.json` files only after reopening the pack
+from disk and byte-comparing every one. Measured on the real store, **792
+manifests: 3.09 MiB of 4 KiB clusters → 113 KiB, 27.9×**. Manifests were the only
+uncompressed tier and had grown to outweigh every archive combined. Reads try the
+loose file first, exactly as a blob read tries `.zst` before the archive. See
+[internal/store/mpack.go](internal/store/mpack.go) and
+[docs/store-efficiency.md](docs/store-efficiency.md); reproduce the audit with
+`python3 tools/store-audit.py`.
 
 **Dashboard (this cycle).** `--ui-port N` starts a second, read-only HTTP server
 inside the `serve` process. Sessions → turns → detail with four tabs (Timeline /
@@ -58,7 +69,11 @@ is a bug even if every test passes.
    client must never see a clean finish for an unrecorded response; on failure
    the connection is aborted without a clean EOF.
 3. **Manifests are the source of truth.** `index.db` is a projection and must
-   stay deletable-and-rebuildable. Never put data only in SQLite.
+   stay deletable-and-rebuildable. Never put data only in SQLite. A manifest is
+   still authoritative once the sweep folds it into a `.gxm` pack — `EachID` and
+   `Read` see both tiers, so a rebuild is identical either way
+   (`TestIndexRebuildAfterPackingIsIdentical`). Manifests are never compressed on
+   the write path; folding happens only in the sweep.
 4. **Credentials are never persisted.** The auth header is forwarded, not
    captured, and no stored identity is derived from it.
 5. **The observer must never block the proxy.** `Hub.OnExchange` runs on the
@@ -80,7 +95,10 @@ is a bug even if every test passes.
    dependency graph stays a forest of depth one, which is why deletion and
    integrity are per-session and there are no refcounts. A resumed session is
    *rebuilt*, never chained onto — measured smaller than chaining, and it keeps
-   the graph edge-free.
+   the graph edge-free. A session's `.gxm` manifest pack is self-contained on the
+   same terms; it is a *sibling* of the `.gxa` rather than a section inside it
+   precisely so that damage to the bodies cannot also destroy the record of what
+   they were, which is what `fsck` needs to name the affected exchanges.
 
 9. **An archive is found by computing its name, never by looking it up.**
    `archiveFile` is `s-<sha256(session id)[:16]>` and nothing maps a session to a
@@ -355,6 +373,28 @@ path may need them to be right in order to fail safely.
   closing it properly would mean holding the blob cache's lock across the install,
   which is a cross-instance lock for a window of microseconds.
 
+- **The live tier is the largest remaining cost, and there is no cheap fix.**
+  Per-blob zstd gets 2.68–2.75× where the same bytes as one solid stream get
+  ~31–36×, but the gap is not reachable per-blob: measured, raising the level buys
+  −6.0% at L7 for 3.3× slower and −10.9% at L19 for 57× slower, on the fail-closed
+  write path. Do not raise `SpeedDefault` in `blob.go`. The only real lever is
+  `--archive-after`, and shortening it trades disk against rebuilding resumed
+  sessions. Left at 30m deliberately.
+- **Cross-session sharing is worth ~30% of the archive tier and costs invariant 8.**
+  A trained 110 KiB dictionary is a *net loss* (−7.6%); a 1 MiB shared raw prefix
+  wins 27.3%, because the shared material is megabytes of long-range literal
+  matches, not a distribution. Grouping per project recovers only 6.7% — the
+  redundancy is cross-project boilerplate, not project code. Not recommended; see
+  [docs/store-efficiency.md](docs/store-efficiency.md).
+- **Two known-flaky tests on Windows, both pre-existing and both test-only.**
+  `TestGetSeesRebuiltArchive` and `TestArchiveLockSurvivesBeingTakenOver` fail when
+  run in a filtered subset because their helpers bypass the real install path and
+  so never call `forget`, and Windows refuses `os.Rename`/`os.Remove` on a file this
+  process holds open. `internal/web`'s `TestExchangesMergesInflight` fails on an
+  ordering assertion. `go test ./...` is therefore **not** green on this platform.
+  Opening archives with `FILE_SHARE_DELETE` would dissolve the whole class — and
+  most of invariant 7's machinery with it — but Go's `os.Open` does not.
+
 ### Deferred features, already seamed for
 
 - `goxray ui` subcommand for browsing an existing store without running the
@@ -410,10 +450,16 @@ it by hand or checking it.
 
 ```bash
 goxray archive                  # dry run: sessions eligible and bytes at stake
-goxray archive --apply          # fold idle sessions into archives
-goxray fsck                     # verify every chunk against its own hash
+goxray archive --apply          # fold idle sessions into archives + manifest packs
+goxray fsck                     # verify every chunk and every packed manifest
 goxray archive --unarchive --apply   # put it all back, byte for byte
 ```
+
+A store archived before manifest packing needs no migration: a session whose
+manifests are still loose no longer counts as "already archived", so the next
+sweep folds them. It does not rebuild the body archive to do that — with nothing
+live to fold in, the archive already holds every body, so only the small pack is
+written.
 
 `--archive-after 0` disables the background sweep. A hand-run `archive` and the
 sweep exclude each other through a lock file in `archives/`.

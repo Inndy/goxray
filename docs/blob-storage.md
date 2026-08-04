@@ -5,7 +5,11 @@ Supersedes the delta-chain plan in [disk-space.md](disk-space.md), whose numbers
 came from a synthetic corpus.
 
 Code: `internal/store/{chunk,archive,compact,sweeper,fsck}.go`, `goxray archive`,
-`goxray fsck`, `serve --archive-after`. Measured on the real store by
+`goxray fsck`, `serve --archive-after`. The same sweep also folds each session's
+*manifests* into a sibling `.gxm` pack — a separate file and a separate format,
+for reasons in [mpack.go](../internal/store/mpack.go) and
+[store-efficiency.md](store-efficiency.md); nothing in this document is affected
+by it. Measured on the real store by
 `TestArchiveFixtureRoundTrip` (opt-in, see Reproducing): **131.4 MiB → 4.6 MiB,
 28.7×**, all 1384 bodies byte-identical after both archive and unarchive, fsck
 clean, 2.3 s to archive the whole store.
@@ -512,9 +516,16 @@ costs a mapping, a GC, and an invariant.
   bound (70.3% of the win is intra-session) is the number to trust if a
   different store looks different. Re-run `archive` before believing any ratio
   here elsewhere.
-- **Pool residency scales with session length.** 10.70 MiB for a 342-body
-  session. A pathological session — thousands of turns, no compaction — would
-  want the pool split; the split variants are measured above and cost ~5%.
+- ~~**Pool residency scales with session length.**~~ **Fixed 2026-08-04.**
+  10.70 MiB for a 342-body session when this was written; re-measured on a larger
+  store the biggest pool had reached **14.80 MiB against a 16 MiB
+  `archiveWindow`** — 92% of it — where dropping the window to 8 MiB costs 21.4%.
+  `poolFlushAt` and `archiveWindow` are now both `1<<25`, so the window spans a
+  whole frame by construction rather than by coincidence, and a pool past 32 MiB
+  degrades to the ~5% frame split measured above instead of a silent truncation.
+  `archiveMaxFrameRaw` stayed at 64 MiB: it is a format limit, and lowering it
+  would reject a frame an older build could legitimately have written. See
+  [store-efficiency.md](store-efficiency.md#finding-3-the-solid-pool-window-was-nearly-binding--fixed).
 - **Do not use `SpeedFastest` with dictionaries** if one is ever reintroduced:
   measured 899 KB versus 85 KB at `SpeedDefault` on the same delta.
 
