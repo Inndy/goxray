@@ -56,6 +56,12 @@ inside the `serve` process. Sessions → turns → detail with four tabs (Timeli
 System / Tools / Raw), live turn streaming over SSE, inflight rows visible while
 a turn is still running.
 
+**Context window per turn (this cycle).** `req.ctx_window` is parsed at capture
+time and projected into the index, so a row — including the inflight one the SSE
+frame carries — shows its context percentage against the right denominator with
+no detail fetch. Older captures have no such field; `goxray migrate-usage`
+recovers it from the stored request blobs.
+
 ---
 
 ## Invariants — do not break these
@@ -159,7 +165,8 @@ capture rather than porting blind:
 - Untagged `[SYSTEM NOTIFICATION - NOT USER INPUT]` messages up to 46k chars
   would otherwise render as human input.
 - The `[1m]` context marker lives in the **system prompt text**, not the model
-  id — hence `CtxWindow(model string, system json.RawMessage)`.
+  id — hence `wire.CtxWindow(model string, system json.RawMessage)`, and hence
+  the window being recorded per turn (below) rather than derived on read.
 
 ### Pricing
 
@@ -214,6 +221,31 @@ unmodelled block types survive. A stream that never reached `message_stop` is
 marked `truncated` and its blocks are still emitted; a `tool_use` whose argument
 JSON was cut mid-stream keeps the fragment in `partial_input` rather than
 dropping the only record of the call.
+
+### The context window is recorded, unlike the cost
+
+Cost is derived on every read because the rate table moves under it; the context
+window is written into the manifest at capture time, because the thing it is
+derived *from* is not always in reach. The `[1m]` marker usually appears only in
+the system prompt, so deriving the window means reading a request blob — and a
+listing has 500 manifests and no bodies. That is why a row used to render
+composition-only until some turn of the same (session, model) had been opened,
+and why the window is now `req.ctx_window`, parsed once by `ParseRequest` — which
+already has the system prompt in hand — and projected into the index like any
+other request field. `wire.CtxWindow` lives beside `ParseRequest` rather than in
+`internal/view` for the same reason: it is consulted at capture, not at render.
+
+Rows and the detail pane must never disagree about it, so the detail seeds from
+the recorded value and lets the body it fetched correct it, rather than starting
+from the 200K default. The dashboard keeps its learn-from-detail cache purely for
+manifests written before the field existed; a store that has run
+`goxray migrate-usage` never consults it.
+
+Two properties fall out of recording it rather than deriving it per row: the
+inflight SSE frame already carries the window, so a turn is correct the moment it
+appears rather than once it finishes, and a turn whose request body was
+unparseable reports `0` — rendered as unknown — instead of a confident 200K that
+would show a 1M turn at five times its real fill.
 
 ### Security model
 
@@ -318,13 +350,12 @@ path may need them to be right in order to fail safely.
   before the TTL split was parsed has no `cache_creation_5m/1h`, so it bills at
   the 5m rate. `goxray migrate-usage --apply` recovers the split from the stored
   response blobs; until it is run on a store, those turns read ~26% low.
-- **A turn row shows a context percentage only once some turn of the same model
-  has been opened.** The `[1m]` marker lives in the system prompt, which only the
-  detail fetch parses, so the window is learned per (session, model) from loaded
-  details — rows of a model you have not opened render composition-only. Recording
-  the window into the request metadata at capture time would light up every row
-  without a detail load, at the cost of a manifest field and a backfill.
-- **`CtxWindow`'s 200K fallback is the client's window, not the model's.** The
+- **A turn recorded before `req.ctx_window` existed still needs a click.** The
+  window is now captured per turn (see below), but no older manifest has it, so
+  the dashboard keeps the fallback that learns it per (session, model) from
+  loaded details. `goxray migrate-usage --apply` fills the field in and the
+  fallback stops mattering.
+- **`wire.CtxWindow`'s 200K fallback is the client's window, not the model's.** The
   `[1m]` marker records what Claude Code will *use*; on the current generation
   Opus, Sonnet, and Fable are all 1M by default and only Haiku 4.5 is really
   200K. The fallback is therefore right for a Haiku side-turn and low for a bare
@@ -430,19 +461,23 @@ pnpm -C ui format  # oxfmt src/
 Run the dashboard: `./goxray --port 5599 --ui-port 5600`
 
 **Repairing a store after a pricing change.** Costs are derived on read, so a
-rate edit only needs `rm ~/.goxray/index.db*` and a restart. Recovering usage
-detail an older capture never parsed is the separate, one-time step:
+rate edit only needs `rm ~/.goxray/index.db*` and a restart. Recovering detail an
+older capture never parsed is the separate, one-time step:
 
 ```bash
 goxray migrate-usage            # dry run: what would change, and the cost delta
 goxray migrate-usage --apply    # rewrite manifests, then delete index.db
 ```
 
-It re-parses response blobs through the live `WireParser` — the only place the
-cache TTL split survives — deliberately breaking the "blobs are never re-parsed"
-rule that holds for index rebuilds. Reusing the parser is not optional: a stream
-reports usage in several events, so anything that sums instead of assigning
-double-counts. Safe against a running proxy (inflight and sub-minute-old
+It re-parses stored blobs through the live `WireParser`, deliberately breaking the
+"blobs are never re-parsed" rule that holds for index rebuilds, and recovers two
+things the manifest could not hold at the time: the cache TTL split, from the
+response blob, and `req.ctx_window`, from the request blob. Reusing the parser is
+not optional on either side: a stream reports usage in several events, so anything
+that sums instead of assigning double-counts, and the window is exactly what
+`ParseRequest` now decides at capture time. The two fail independently — a turn
+whose response was never recorded still gets a window, which is the row most in
+need of a denominator. Safe against a running proxy (inflight and sub-minute-old
 manifests are skipped, writes are atomic renames) and idempotent.
 
 **Reclaiming disk.** Archiving runs on its own in `serve`; these are for doing
