@@ -66,14 +66,18 @@ const (
 	frameDirLen   = 8 + 4 + 4
 
 	// poolFlushAt bounds builder memory. One solid frame compresses best and
-	// every real session is far under this (the largest measured pool was
-	// 10.7 MiB), so this only exists so a pathological session cannot exhaust
-	// memory rather than as a tuning knob.
-	poolFlushAt = 64 << 20
-
-	// archiveWindow must be at least as large as a pool frame for the
-	// compressor to match across the whole of it.
-	archiveWindow = 1 << 24
+	// every real session is far under this, so this is a safety valve against a
+	// pathological session rather than a tuning knob.
+	//
+	// archiveWindow must be at least as large as a pool frame for the compressor
+	// to match across the whole of it, so the two are one decision and are
+	// written as one. They used to disagree — 64 MiB against a 16 MiB window —
+	// which left any frame over 16 MiB only partly matchable, and the largest
+	// real pool had already reached 14.8 MiB against that window. Measured on it,
+	// an 8 MiB window costs 21.4% and a 4 MiB window 33.5%, so the cliff was real
+	// and silent. Keeping them equal is what removes it.
+	poolFlushAt   = 1 << 25
+	archiveWindow = poolFlushAt
 )
 
 // Format limits. Every count, offset and length in an archive header is
@@ -83,9 +87,11 @@ const (
 // dashboard included. Each limit is also enforced by the builder, so it can only
 // ever reject a file goxray did not write.
 const (
-	// archiveMaxFrameRaw is one decoded pool frame: the builder flushes at
-	// poolFlushAt and can overshoot by at most one chunk.
-	archiveMaxFrameRaw = poolFlushAt + chunkMax
+	// archiveMaxFrameRaw is one decoded pool frame. Deliberately *not* derived
+	// from poolFlushAt: a build from before that was lowered could have flushed a
+	// 64 MiB frame, and a limit that rejected it would be rejecting a file goxray
+	// wrote. It only ever moves up.
+	archiveMaxFrameRaw = (64 << 20) + chunkMax
 	// archiveMaxPool is every frame of one archive decoded, i.e. the session's
 	// unique content. The largest measured on a real store was 10.7 MiB.
 	archiveMaxPool = 2 << 30
