@@ -167,8 +167,9 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-// cmdMigrateUsage backfills usage detail that older captures did not record,
-// re-parsing the stored response blobs. Dry-run unless --apply is passed.
+// cmdMigrateUsage backfills the metadata older captures did not record — the
+// cache-creation TTL split and the context window — by re-parsing the stored
+// blobs. Dry-run unless --apply is passed.
 func cmdMigrateUsage(cfg *config.Config, args []string) error {
 	fs := flag.NewFlagSet("migrate-usage", flag.ContinueOnError)
 	apply := fs.Bool("apply", false, "write the changes (default is a dry run)")
@@ -189,6 +190,9 @@ func cmdMigrateUsage(cfg *config.Config, args []string) error {
 		mode, st.Scanned, st.Updated, st.Skipped, st.Failed)
 	fmt.Printf("cost with current rates: $%.4f -> $%.4f (%+.4f)\n",
 		st.CostFrom, st.CostTo, st.CostTo-st.CostFrom)
+	if st.Windows > 0 {
+		fmt.Printf("context window recovered for %d turn(s)\n", st.Windows)
+	}
 	if *apply && st.Updated > 0 {
 		fmt.Println("delete index.db and restart to reproject the corrected costs")
 	}

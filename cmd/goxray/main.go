@@ -156,7 +156,7 @@ func printUsage() {
   goxray ls   [--session id]  list recorded exchanges (newest first)
   goxray show <id>            show one exchange's parsed metadata
   goxray raw  <id> [req|res]  dump verbatim recorded bytes (default req)
-  goxray migrate-usage        backfill usage detail from stored blobs (--apply)
+  goxray migrate-usage        backfill usage + ctx window from blobs (--apply)
   goxray archive              fold idle sessions into archives (--apply)
   goxray fsck                 verify archive integrity
 

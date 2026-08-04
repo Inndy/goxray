@@ -110,6 +110,62 @@ func TestMigrateUsageBackfillsTTLSplit(t *testing.T) {
 	}
 }
 
+// The window is recorded per turn now, but no older capture has it, and it is
+// only in the request body — so the backfill has to read the request side, which
+// the usage pass never touched. A turn whose response was never recorded still
+// gets one: it is the case where a listing row is most in need of a denominator.
+func TestMigrateUsageBackfillsCtxWindow(t *testing.T) {
+	d := t.TempDir()
+	blobsDir := filepath.Join(d, "blobs")
+	manDir := filepath.Join(d, "manifests")
+	arcDir := filepath.Join(d, "archives")
+
+	blobs, err := newLocalBlobs(blobsDir, arcDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A bare model id, with the exact one named only inside the system prompt.
+	reqRef, err := blobs.Put([]byte(`{"model":"claude-opus-5","system":[{"type":"text","text":"The exact model ID is claude-opus-5[1m]."}],"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	man := newLocalManifests(manDir, arcDir)
+	id := "00000000-0000-7000-8000-00000000dd03"
+	ex := &model.Exchange{
+		ID: id, State: model.StatePersistFailed, ReqRef: reqRef,
+		Req: model.ReqMeta{Model: "claude-opus-5"},
+	}
+	if err := man.Write(ex); err != nil {
+		t.Fatal(err)
+	}
+	backdate(t, man.path(id))
+
+	st, err := MigrateUsage(blobsDir, manDir, arcDir, wire.Anthropic{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Windows != 1 || st.Updated != 1 {
+		t.Fatalf("windows=%d updated=%d, want 1/1", st.Windows, st.Updated)
+	}
+	got, err := man.Read(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Req.CtxWindow != 1_000_000 {
+		t.Errorf("ctx window = %d, want 1000000", got.Req.CtxWindow)
+	}
+
+	backdate(t, man.path(id))
+	again, err := MigrateUsage(blobsDir, manDir, arcDir, wire.Anthropic{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Updated != 0 || again.Windows != 0 {
+		t.Errorf("second pass updated=%d windows=%d, want 0/0", again.Updated, again.Windows)
+	}
+}
+
 // backdate pushes a file's mtime outside the quiesce window.
 func backdate(t *testing.T, path string) {
 	t.Helper()

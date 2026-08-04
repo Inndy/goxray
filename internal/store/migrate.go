@@ -12,12 +12,15 @@ import (
 	"go.inndy.tw/goxray/internal/wire"
 )
 
-// MigrateStats reports what a MigrateUsage pass found or changed.
+// MigrateStats reports what a MigrateUsage pass found or changed. A manifest
+// that was examined and had nothing to recover lands in none of the counters
+// but Scanned.
 type MigrateStats struct {
 	Scanned  int
 	Updated  int
-	Skipped  int // inflight, too recent, or no response blob
-	Failed   int // blob unreadable or unparseable
+	Skipped  int // inflight or still inside the quiet window: not examined
+	Failed   int // a blob was unreadable or unparseable
+	Windows  int // context windows recovered from request blobs
 	CostFrom float64
 	CostTo   float64
 }
@@ -29,9 +32,10 @@ type MigrateStats struct {
 // commit gap and costs only a second pass for anything still settling.
 const migrateQuiesce = time.Minute
 
-// MigrateUsage re-parses recorded response blobs and backfills the usage detail
-// that older captures did not keep — the cache-creation TTL split above all,
-// without which 1h writes are billed at the 5m rate.
+// MigrateUsage re-parses recorded blobs and backfills the metadata that older
+// captures did not keep: the cache-creation TTL split above all, without which
+// 1h writes are billed at the 5m rate, and the context window, without which a
+// listing row cannot show a context percentage until the turn is opened.
 //
 // This deliberately breaks the "blobs are never re-parsed" rule that holds for
 // index rebuilds. A rebuild is a hot path that must stay cheap and must not
@@ -86,27 +90,50 @@ func MigrateUsage(blobsDir, manifestsDir, archivesDir string, parser wire.WirePa
 			st.Failed++
 			return nil
 		}
-		if ex.State == model.StateInflight || ex.ResRef == "" {
+		// An inflight manifest is the one the recorder is still going to supersede;
+		// the quiet window above cannot protect it, since a stream may run for
+		// minutes before the final write.
+		if ex.State == model.StateInflight {
 			st.Skipped++
 			return nil
 		}
 
+		changed := false
+
+		// The context window comes from the request body, and the marker that
+		// reveals it usually sits in the system prompt. Reusing the live parser
+		// keeps this in step with what capture now records; only the window is
+		// taken from the re-parse, so a parser that has since changed its mind
+		// about cwd or session id cannot rewrite history through this path.
+		if ex.Req.CtxWindow == 0 && ex.ReqRef != "" {
+			raw, err := blobs.Get(ex.Req.SessionID, ex.ReqRef)
+			if err != nil {
+				st.Failed++
+			} else if w := parser.ParseRequest(nil, raw).CtxWindow; w > 0 {
+				ex.Req.CtxWindow = w
+				st.Windows++
+				changed = true
+			}
+		}
+
+		if ex.ResRef == "" {
+			return finishMigrate(&st, manifests, &ex, changed, apply)
+		}
 		raw, err := blobs.Get(ex.Req.SessionID, ex.ResRef)
 		if err != nil {
 			st.Failed++
-			return nil
+			return finishMigrate(&st, manifests, &ex, changed, apply)
 		}
 		// A recorded-but-empty body is normal (204s, 404s, aborted streams) and
 		// has no usage to recover. Counting it as a failure would bury a real
 		// parse regression in expected noise.
 		if len(raw) == 0 {
-			st.Skipped++
-			return nil
+			return finishMigrate(&st, manifests, &ex, changed, apply)
 		}
 		meta, ok := parser.ParseResponse(nil, raw, ex.ResHeaders["content-type"])
 		if !ok {
 			st.Failed++
-			return nil
+			return finishMigrate(&st, manifests, &ex, changed, apply)
 		}
 
 		// Only the fields the old capture could not hold are taken from the
@@ -123,17 +150,24 @@ func MigrateUsage(blobsDir, manifestsDir, archivesDir string, parser wire.WirePa
 		st.CostFrom += pricing.Price(before, ex.Req.Model)
 		st.CostTo += pricing.Price(ex.Res, ex.Req.Model)
 
-		if ex.Res == before {
-			return nil
-		}
-		st.Updated++
-		if !apply {
-			return nil
-		}
-		return manifests.Write(&ex)
+		return finishMigrate(&st, manifests, &ex, changed || ex.Res != before, apply)
 	})
 	if errors.Is(err, os.ErrNotExist) {
 		return st, nil
 	}
 	return st, err
+}
+
+// finishMigrate records the outcome for one manifest and writes it when there is
+// something to write. It exists because the two backfills fail independently —
+// a missing response body must not cost a recovered context window its rewrite.
+func finishMigrate(st *MigrateStats, manifests *localManifests, ex *model.Exchange, changed, apply bool) error {
+	if !changed {
+		return nil
+	}
+	st.Updated++
+	if !apply {
+		return nil
+	}
+	return manifests.Write(ex)
 }
