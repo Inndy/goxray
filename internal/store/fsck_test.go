@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/binary"
 	"errors"
 	"io/fs"
 	"os"
@@ -85,6 +86,43 @@ func TestFsckReportsDamage(t *testing.T) {
 		if m.Session != session || m.Exchange == "" {
 			t.Errorf("unhelpful missing entry: %+v", m)
 		}
+	}
+}
+
+// The trailer is what lets the test above say an archive is not where its
+// session would look for it. Zeroing its length shifts no offset, so the file
+// still parses, verifies and resolves every body — and fsck reported the one
+// damage that disables its own diagnostic as a clean store.
+func TestFsckReportsAnArchiveThatLostItsSession(t *testing.T) {
+	p := tmpPaths(t)
+	st := openStoreAt(t, p)
+	const session = "sess-noident-000-0000-00000000000c"
+	recordSession(t, st, session, 3)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	archiveAt(t, p, nil)
+
+	path := archiveFile(p.archives, session)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint16(raw[6:], 0)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := Fsck(FsckOptions{BlobsDir: p.blobs, ManifestsDir: p.manifests, ArchivesDir: p.archives})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Problems) == 0 {
+		t.Fatal("fsck passed an archive that no longer records its session")
+	}
+	// And the bodies it can no longer prove are named, as for any other damage.
+	if len(got.Missing) != 6 {
+		t.Errorf("named %d unreadable bodies, want 6", len(got.Missing))
 	}
 }
 

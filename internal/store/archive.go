@@ -341,13 +341,27 @@ func openArchive(path string) (*archiveReader, error) {
 		f.Close()
 		return nil, fmt.Errorf("archive %s: unsupported version %d", path, version)
 	}
-	// v1 reserved these two bytes and wrote zero. Anything else in a v1 file is
-	// damage, not a trailer, and reading it as a length would carve bytes off
-	// the pool.
+	// v1 reserved these two bytes and wrote zero, so anything else in a v1 file is
+	// damage, not a trailer, and reading it as a length would carve bytes off the
+	// pool. From v2 they are the trailer length, and no writer can produce an
+	// empty or oversized one: newArchiveBuilder refuses both, and so does the
+	// migration script. A zeroed length is rejected here rather than left to
+	// surface later because it never would: every section still parses, every
+	// chunk still verifies, and all that is gone is the one thing the trailer
+	// exists to record — so fsck would pass a digest-named archive it can no
+	// longer prove is filed where its session would look for it.
 	sessionLen := binary.LittleEndian.Uint16(hdr[6:])
-	if version < 2 && sessionLen != 0 {
+	switch {
+	case version < 2 && sessionLen != 0:
 		f.Close()
 		return nil, fmt.Errorf("archive %s: v1 header has %d in its reserved field", path, sessionLen)
+	case version >= 2 && sessionLen == 0:
+		f.Close()
+		return nil, fmt.Errorf("archive %s: v2 header declares no session", path)
+	case sessionLen > archiveMaxSession:
+		f.Close()
+		return nil, fmt.Errorf("archive %s: session trailer is %d bytes, over the %d-byte limit",
+			path, sessionLen, archiveMaxSession)
 	}
 	nchunks := binary.LittleEndian.Uint32(hdr[8:])
 	nframes := binary.LittleEndian.Uint32(hdr[12:])

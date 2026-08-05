@@ -439,3 +439,54 @@ func TestArchiveRejectsAnOversizedTrailer(t *testing.T) {
 		t.Error("openArchive accepted a trailer longer than the file")
 	}
 }
+
+// Zeroing the length is the one damage to a v2 file that changes no offset: it
+// parses, verifies and resolves every body, having lost only the session it
+// records. See TestFsckReportsAnArchiveThatLostItsSession for what accepting it
+// costs.
+func TestArchiveRejectsV2WithNoSession(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a"+archiveExt)
+	buildArchive(t, path, []string{"a"}, [][]byte{[]byte("hello")})
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint16(raw[6:], 0)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openArchive(path); err == nil {
+		t.Error("openArchive accepted a v2 header declaring no session")
+	}
+}
+
+// A trailer past the bound the builder writes within is damage even when it fits
+// in the file, and saying so beats reporting it as whichever section its shifted
+// EOF happened to cut short.
+func TestArchiveRejectsATrailerOverTheLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a"+archiveExt)
+	bodies := conversation(6)
+	refs := make([]string, len(bodies))
+	for i := range bodies {
+		refs[i] = fmt.Sprintf("ref-%d", i)
+	}
+	buildArchive(t, path, refs, bodies)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= archiveMaxSession {
+		t.Fatalf("fixture is %d bytes, too small to hold an over-limit trailer", len(raw))
+	}
+	binary.LittleEndian.PutUint16(raw[6:], archiveMaxSession+1)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = openArchive(path)
+	if err == nil {
+		t.Fatal("openArchive accepted a trailer over the session limit")
+	}
+	if !strings.Contains(err.Error(), "session trailer") {
+		t.Errorf("blamed something other than the trailer: %v", err)
+	}
+}
