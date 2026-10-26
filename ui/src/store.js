@@ -69,6 +69,13 @@ export const gaps = computed(() => {
   return out
 })
 
+// The session a loaded row belongs to. Opening a turn scopes the list to this,
+// so the "Turns" pane means one session rather than a global feed a new session
+// can slide into. A sessionless turn (side turn, subagent) resolves to '' and so
+// deliberately leaves the list unfiltered: there is no session to narrow to.
+export const sessionOfExchange = (id) =>
+  state.exchanges.find((e) => e.id === id)?.req?.session_id || ''
+
 const ctxKey = (sid, model) => `${sid}|${model || ''}`
 
 // The window a turn was working against. Recorded on the turn itself, so a row
@@ -114,11 +121,14 @@ export async function loadExchanges() {
   }
 }
 
+// Does not touch the turn selection: the route carries both, and applyRoute
+// applies the id on its own. Clearing it here was redundant when a session was
+// picked from the pane (that route has no id, so selectExchange('') clears it
+// anyway) and actively wrong now that opening a turn also sets the session —
+// re-opening the turn already on screen would have blanked it.
 export async function selectSession(sid) {
   if (state.selectedSession === sid) return
   state.selectedSession = sid
-  state.selectedId = ''
-  state.detail = null
   await loadExchanges()
 }
 
@@ -155,13 +165,40 @@ export function setFollow(v) {
 }
 
 function upsert(ex) {
+  // A foreign turn is invisible under an active session filter anyway, so
+  // dropping it here just keeps a long-lived page from accumulating every
+  // session's turns forever. Deselecting the session refetches, so nothing is
+  // lost by not holding them.
+  if (state.selectedSession && (ex.req?.session_id || '') !== state.selectedSession) return
   const i = state.exchanges.findIndex((e) => e.id === ex.id)
   if (i >= 0) state.exchanges[i] = ex
   else state.exchanges.unshift(ex)
 }
 
+// Every live frame moves the session rollups — a new session, another turn, more
+// cost — and the pane is pure aggregate, so refetching it can never disturb the
+// selection. Gating it on "nothing selected" therefore bought nothing and cost
+// the feature: a reader who had clicked any turn saw no new session at all until
+// they reloaded the page. Coalescing is the real concern, since each turn arrives
+// twice and a busy proxy streams several a second.
+const sessionsRefreshMS = 500
+let sessionsTimer = null
+
+function refreshSessionsSoon() {
+  if (sessionsTimer) return
+  sessionsTimer = setTimeout(() => {
+    sessionsTimer = null
+    loadSessions()
+  }, sessionsRefreshMS)
+}
+
+function cancelSessionsRefresh() {
+  clearTimeout(sessionsTimer)
+  sessionsTimer = null
+}
+
 export function startLive() {
-  return subscribeEvents({
+  const stop = subscribeEvents({
     onStatus: (s) => {
       state.liveStatus = s
     },
@@ -170,7 +207,7 @@ export function startLive() {
       // A turn that finishes while selected should refresh, since a response
       // body now exists where a moment ago there was none.
       if (ex.id === state.selectedId && ex.state !== 'inflight') selectExchange(ex.id)
-      if (state.follow && !state.selectedId) loadSessions()
+      if (state.follow) refreshSessionsSoon()
     },
     // No replay buffer server-side, so a reconnect means refetching from the
     // durable index rather than trusting the stream to have been continuous.
@@ -179,6 +216,10 @@ export function startLive() {
       loadExchanges()
     },
   })
+  return () => {
+    cancelSessionsRefresh()
+    stop()
+  }
 }
 
 export async function init() {

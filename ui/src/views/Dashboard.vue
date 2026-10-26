@@ -11,6 +11,7 @@ import {
   init,
   selectExchange,
   selectSession,
+  sessionOfExchange,
   setFollow,
   setShowNoise,
   startLive,
@@ -32,8 +33,14 @@ async function applyRoute() {
   const raw = route.params.session || ''
   const sid = raw === NO_SESSION ? '' : raw
   const id = route.params.id || ''
-  if (sid !== store.selectedSession) await selectSession(sid)
-  if (id !== store.selectedId) await selectExchange(id)
+  // Both comparisons read the pre-change state, so they must happen before
+  // either call mutates it. The two fetches then overlap rather than serializing
+  // the detail behind the list — opening a turn from the unfiltered list now
+  // reloads both, and awaiting them in sequence showed a spinner for the sum.
+  const jobs = []
+  if (id !== store.selectedId) jobs.push(selectExchange(id))
+  if (sid !== store.selectedSession) jobs.push(selectSession(sid))
+  await Promise.all(jobs)
 }
 
 function pushSelection(sid, id) {
@@ -55,7 +62,13 @@ onUnmounted(() => stopLive?.())
 watch(() => [route.params.session, route.params.id], applyRoute)
 
 const onSession = (sid) => pushSelection(sid, '')
-const onTurn = (id) => pushSelection(store.selectedSession, id)
+
+// Opening a turn adopts its session, rather than carrying whichever session was
+// already selected. Passing the old one meant a turn reached from the unfiltered
+// list left the list unfiltered, so every new session's turns kept sliding into
+// what read as one session's history. A sessionless turn resolves to '' and
+// keeps the list global, which is the only honest scope for it.
+const onTurn = (id) => pushSelection(sessionOfExchange(id), id)
 </script>
 
 <template>

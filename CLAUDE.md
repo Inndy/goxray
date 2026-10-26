@@ -316,6 +316,24 @@ path may need them to be right in order to fail safely.
 
 - `Session.Sources` is always `[]string{}`, never nil — a Go nil slice marshals
   to JSON `null` and blanked the sessions pane. Vue also guards with `?.length`.
+- **`/api/sessions` overlays inflight turns too**, for the same reason
+  `/api/exchanges` does: the rollup is a `GROUP BY` over the index, and an index
+  row appears when a *response* commits, so a brand-new session was absent from
+  the pane for the whole duration of its first turn — while that turn was already
+  in the turn list. Usage stays at what the index reported (zero for a first
+  turn); the row corrects itself on commit. Together with the client half — the
+  session refetch used to be gated on `!selectedId`, so a reader who had clicked
+  any turn never saw a new session until reloading the page — this is what makes
+  new sessions appear on their own. The refetch is coalesced (500 ms): a turn
+  arrives twice and a busy proxy streams several a second.
+- **A late-arriving session title needs no mechanism of its own.** A title-gen
+  turn carries the real `session_id` and is *not* noise, so it reaches the hub
+  like any turn and the refetch above picks the title up within 500 ms. Measured
+  across the 13 titled sessions in the real store, 6 are titled by their very
+  first turn and the rest by their second, 15 s to 128 s in. Until then the pane
+  shows `basename(cwd)`, not a blank — see `label()` in `SessionList.vue`. The
+  `title` subquery in `querySessions` deliberately has no noise predicate, so the
+  title still resolves for a session viewed with noise hidden.
 - `querySessions` uses correlated subqueries for model/cwd/title: a bare column
   alongside two aggregates is not guaranteed by SQLite.
 - The router uses `NO_SESSION = '-'` as a path sentinel, decoded back to `''`.
