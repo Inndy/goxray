@@ -1,5 +1,7 @@
 /goxray
 /goxray.exe
+# Go's sidecar when it builds over a goxray.exe this machine is still running.
+/goxray.exe~
 
 ui/node_modules/
 .DS_Store

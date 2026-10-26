@@ -452,7 +452,7 @@ make build        # pnpm build into internal/web/dist, then go build
 make ui           # bundle only
 make ui-dev       # vite :5173, proxies /api to a dashboard on :5600
 make test         # go test ./...
-go build -o goxray ./cmd/goxray   # no Node needed; dist is committed
+go build ./cmd/goxray             # no Node needed; dist is committed
 
 pnpm -C ui lint    # oxlint + eslint, both with --fix
 pnpm -C ui format  # oxfmt src/
@@ -537,7 +537,22 @@ before rebinding — killing and restarting in one command races.
 
 **Rebuild before testing a UI change.** A stale `goxray` binary serves the old
 embedded bundle and the old flags; more than one confusing debugging session has
-started this way.
+started this way. Two Windows-specific traps sit on top of that, and both look
+exactly like "my code change did nothing":
+
+- **Never pass `-o` to the build.** An explicit `-o` suppresses the platform
+  suffix, so the Makefile's original `-o goxray` wrote an extensionless `goxray`
+  on Windows while the binary anyone actually launches is `goxray.exe`. `make`
+  exited 0, the UI stayed stale, and nothing anywhere failed. Bare
+  `go build ./cmd/goxray` names the output after the package directory *with*
+  the suffix, on every platform.
+- **Rebuilding is not restarting.** Windows does let you build over a running
+  `goxray.exe` — Go renames the in-use image to `goxray.exe~` and installs the
+  new one — so the build succeeds while the live process keeps serving the old
+  code from memory. Confirm what is actually running by comparing the asset hash
+  the dashboard serves against `internal/web/dist/assets/`:
+  `curl -s http://127.0.0.1:5600/ | grep -o 'index-[^.]*\.js'`. The leftover
+  `goxray.exe~` is deletable once the old process exits.
 
 ### Conventions
 
