@@ -62,11 +62,8 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// Addr is the loopback bind address. goxray binds 127.0.0.1 only — the store
-// holds every conversation verbatim and must never be exposed off-loopback
-// without an auth layer.
 func (s *Server) Addr() string {
-	return fmt.Sprintf("127.0.0.1:%d", s.cfg.Port)
+	return fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {

@@ -23,6 +23,7 @@ const DefaultArchiveAfter = 30 * time.Minute
 
 // Config is the resolved runtime configuration.
 type Config struct {
+	Host         string   // expose proxy port?
 	Port         int
 	UIPort       int      // dashboard port; 0 disables it entirely
 	Home         string   // $GOXRAY_HOME, default ~/.goxray
@@ -48,6 +49,7 @@ func (c *Config) UIEnabled() bool { return c.UIPort > 0 }
 // Load parses flags + env into a Config. args excludes the program name.
 func Load(args []string) (*Config, error) {
 	fs := flag.NewFlagSet("goxray", flag.ContinueOnError)
+	host := fs.String("host", envStr("PROXY_HOST", "127.0.0.1"), "proxy listen host")
 	port := fs.Int("port", envInt("PROXY_PORT", 5599), "proxy listen port")
 	uiPort := fs.Int("ui-port", envInt("GOXRAY_UI_PORT", 0), "dashboard listen port (0 = disabled)")
 	home := fs.String("home", envStr("GOXRAY_HOME", ""), "data directory (default ~/.goxray)")
@@ -64,6 +66,7 @@ func Load(args []string) (*Config, error) {
 	}
 
 	c := &Config{
+		Host:         *host,
 		Port:         *port,
 		UIPort:       *uiPort,
 		MaxBodyBytes: int64(*maxBodyMB) * 1024 * 1024,
