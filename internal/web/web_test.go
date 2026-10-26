@@ -343,6 +343,92 @@ func TestExchangesMergesInflight(t *testing.T) {
 	}
 }
 
+// A session's index rows appear when its responses commit, so a session whose
+// first turn is still streaming exists nowhere in the rollup. Without the overlay
+// the pane stays empty for the whole first turn while the turn list already shows
+// it, and no amount of refetching helps.
+func TestSessionsMergesInflight(t *testing.T) {
+	rd := newTestReader()
+	hub := NewHub()
+	now := time.Now().UTC()
+	hub.OnExchange(model.Exchange{
+		ID: "live1", State: model.StateInflight, StartedAt: now,
+		Source: "cli", Req: model.ReqMeta{SessionID: "s2", Model: "claude-opus-5", Cwd: "/tmp/new"},
+	})
+	// A second turn in a session the index already knows must add to it, not
+	// create a duplicate row.
+	hub.OnExchange(model.Exchange{
+		ID: "live2", State: model.StateInflight, StartedAt: now.Add(-time.Second),
+		Req: model.ReqMeta{SessionID: "s1"},
+	})
+	h := Handler(rd, hub, testPort)
+
+	w := do(t, h, "GET", "/api/sessions", nil)
+	var got struct{ Sessions []store.Session }
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Sessions) != 2 {
+		t.Fatalf("got %d sessions, want 2: %+v", len(got.Sessions), got.Sessions)
+	}
+	// Most recently active first, and s2's only activity is the streaming turn.
+	s2 := got.Sessions[0]
+	if s2.SessionID != "s2" {
+		t.Fatalf("newest first: got %q", s2.SessionID)
+	}
+	if s2.Turns != 1 || s2.Cwd != "/tmp/new" || s2.Model != "claude-opus-5" {
+		t.Errorf("inflight session = %+v", s2)
+	}
+	if len(s2.Sources) != 1 || s2.Sources[0] != "cli" {
+		t.Errorf("sources = %+v", s2.Sources)
+	}
+	if s1 := got.Sessions[1]; s1.SessionID != "s1" || s1.Turns != 2 {
+		t.Errorf("known session should gain the inflight turn, got %+v", s1)
+	}
+
+	// Committing clears the overlay; the index (stubbed at 1 turn) is truth again.
+	hub.OnExchange(model.Exchange{ID: "live1", State: model.StateComplete, StartedAt: now,
+		Req: model.ReqMeta{SessionID: "s2"}})
+	hub.OnExchange(model.Exchange{ID: "live2", State: model.StateComplete, StartedAt: now,
+		Req: model.ReqMeta{SessionID: "s1"}})
+	w = do(t, h, "GET", "/api/sessions", nil)
+	got.Sessions = nil
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Sessions) != 1 || got.Sessions[0].Turns != 1 {
+		t.Errorf("after commit got %+v, want just the indexed s1", got.Sessions)
+	}
+}
+
+// A noise turn must not conjure a session the pane is filtered to hide.
+func TestSessionsInflightRespectsNoiseFilter(t *testing.T) {
+	rd := newTestReader()
+	hub := NewHub()
+	hub.OnExchange(model.Exchange{
+		ID: "live1", State: model.StateInflight, StartedAt: time.Now().UTC(), IsNoise: true,
+		Req: model.ReqMeta{SessionID: "s2"},
+	})
+	h := Handler(rd, hub, testPort)
+
+	var got struct{ Sessions []store.Session }
+	w := do(t, h, "GET", "/api/sessions", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Sessions) != 1 {
+		t.Errorf("noise leaked into the default view: %+v", got.Sessions)
+	}
+	got.Sessions = nil
+	w = do(t, h, "GET", "/api/sessions?noise=1", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Sessions) != 2 {
+		t.Errorf("noise=1 should show it: %+v", got.Sessions)
+	}
+}
+
 // ── the hub must never stall the recording path ─────────────────────
 
 func TestHubDoesNotBlockOnSaturatedClient(t *testing.T) {

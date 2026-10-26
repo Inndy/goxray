@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -124,7 +125,75 @@ func (s *server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, map[string]any{"sessions": sessions})
+	writeJSON(w, map[string]any{"sessions": s.mergeInflightSessions(sessions, f)})
+}
+
+// mergeInflightSessions overlays sessions that exist only as streaming turns, on
+// the same grounds as mergeInflight: the rollup is a GROUP BY over the index, and
+// an index row appears when a response commits. Without this a brand-new session
+// is missing from the pane for the whole duration of its first turn — while that
+// very turn is already in the turn list, which does overlay inflight.
+//
+// Usage and cost stay at whatever the index reported, which for a first turn is
+// zero: nothing has told us yet. Undercounting a turn in progress is the honest
+// answer, and the row corrects itself the moment the response commits.
+func (s *server) mergeInflightSessions(rows []store.Session, f store.Filter) []store.Session {
+	if s.hub == nil {
+		return rows
+	}
+	live := s.hub.Inflight()
+	if len(live) == 0 {
+		return rows
+	}
+	at := make(map[string]int, len(rows))
+	for i := range rows {
+		at[rows[i].SessionID] = i
+	}
+	for _, e := range live {
+		if f.Session != "" && e.Req.SessionID != f.Session {
+			continue
+		}
+		if f.Source != "" && e.Source != f.Source {
+			continue
+		}
+		if !f.IncludeNoise && e.IsNoise {
+			continue
+		}
+		ts := e.StartedAt.UnixMilli()
+		if f.Since > 0 && ts <= f.Since {
+			continue
+		}
+		i, ok := at[e.Req.SessionID]
+		if !ok {
+			// Sources is never nil: a Go nil slice marshals to JSON null and blanks
+			// the pane, same as in querySessions.
+			rows = append(rows, store.Session{SessionID: e.Req.SessionID, FirstTS: ts, Sources: []string{}})
+			i = len(rows) - 1
+			at[e.Req.SessionID] = i
+		}
+		r := &rows[i]
+		r.Turns++
+		if e.Req.IsSubagent {
+			r.Subagents++
+		}
+		if ts > r.LastTS {
+			r.LastTS = ts
+		}
+		if ts < r.FirstTS {
+			r.FirstTS = ts
+		}
+		if r.Model == "" {
+			r.Model = e.Req.Model
+		}
+		if r.Cwd == "" {
+			r.Cwd = e.Req.Cwd
+		}
+		if e.Source != "" && !slices.Contains(r.Sources, e.Source) {
+			r.Sources = append(r.Sources, e.Source)
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].LastTS > rows[j].LastTS })
+	return rows
 }
 
 func (s *server) handleExchanges(w http.ResponseWriter, r *http.Request) {
