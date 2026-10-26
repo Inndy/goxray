@@ -46,10 +46,11 @@ claude
 ./goxray raw  <id> [req|res]    # verbatim recorded bytes
 ```
 
-Config (flags or env): `--port`/`PROXY_PORT` (default 5599),
-`--ui-port`/`GOXRAY_UI_PORT` (default 0 = dashboard off), `GOXRAY_HOME`
-(default `~/.goxray`), `--max-body-mb` (default 50), `--upstream`/`GOXRAY_UPSTREAM`.
-Binds `127.0.0.1` only. `GET /healthz` for liveness.
+Config (flags or env): `--host`/`PROXY_HOST` (default `127.0.0.1`),
+`--port`/`PROXY_PORT` (default 5599), `--ui-port`/`GOXRAY_UI_PORT` (default 0 =
+dashboard off), `GOXRAY_HOME` (default `~/.goxray`), `--max-body-mb` (default
+50), `--upstream`/`GOXRAY_UPSTREAM`. `--host` moves only the proxy; the
+dashboard always binds `127.0.0.1`. `GET /healthz` for liveness.
 
 ## Dashboard
 

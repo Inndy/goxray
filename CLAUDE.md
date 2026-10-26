@@ -258,6 +258,13 @@ authentication; exposing the port off loopback needs real auth first.
 Verified empirically: 403 for a foreign `Host`, wrong port, or remote `Origin`;
 200 for a loopback `Origin`; zero CORS headers in any response.
 
+The **proxy** bind address is the operator's choice: `--host`/`PROXY_HOST`,
+default `127.0.0.1`. Listening on another NIC (say, to record a Claude Code on
+another machine) is a supported configuration, not a hole to warn about — the
+default is loopback, so exposure only ever happens because someone asked for
+it. `--host` deliberately does not move the dashboard, which stays hard-wired
+to `127.0.0.1` for the reasons above.
+
 ### Nothing recorded is trusted as a filename or a length
 
 Both halves of the archive path are attacker-shaped data, and both were treating
