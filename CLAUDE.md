@@ -13,8 +13,8 @@ duplicate it here.
 
 | | |
 |---|---|
-| **Stage** | v0 + dashboard MVP + derived pricing, working end to end |
-| **Branch** | `main` — dashboard and pricing work merged; every commit was verified to build and test green in isolation |
+| **Stage** | v0 + dashboard MVP + derived pricing + Codex (WebSocket and HTTP), working end to end |
+| **Branch** | `codex` — Codex support, on top of `main`; every commit verified to build and test green in isolation |
 | **Go** | 1.26, module `go.inndy.tw/goxray` |
 | **Tests** | `go test ./...` — all green. `config`, `model`, `cmd` have no tests |
 | **Size** | ~5k lines Go, ~2.6k lines Vue/JS |
@@ -56,6 +56,19 @@ inside the `serve` process. Sessions → turns → detail with four tabs (Timeli
 System / Tools / Raw), live turn streaming over SSE, inflight rows visible while
 a turn is still running.
 
+**Codex (this cycle).** Codex CLI is recorded with
+`openai_base_url = "http://host:port[/slug]/backend-api/codex"`, over its
+default WebSocket transport and over the HTTP fallback. A WebSocket connection
+is recorded as one append-only log (`blobs/live/<ref>.gxl` while open, sealed
+to an ordinary `.zst` on close); each `response.create` is a turn exchange
+naming its range in that log, and its full request is rebuilt by replaying the
+`previous_response_id` chain. Live-tested against Codex 0.164.0: prewarm,
+incremental turns, forked sub-agents, `/compact`, Esc, hard-kill recovery,
+graceful shutdown, archive and fsck. Design, protocol facts and the review
+history are in [docs/codex.md](docs/codex.md) — read it before touching
+`internal/proxy/ws.go`, `internal/store/{livelog,stream}.go` or
+`internal/wire/{wslog,replay,openai}.go`.
+
 **Context window per turn (this cycle).** `req.ctx_window` is parsed at capture
 time and projected into the index, so a row — including the inflight one the SSE
 frame carries — shows its context percentage against the right denominator with
@@ -74,6 +87,13 @@ is a bug even if every test passes.
 2. **Terminal SSE frames are held back until `PersistResponse` commits.** A
    client must never see a clean finish for an unrecorded response; on failure
    the connection is aborted without a clean EOF.
+
+   On a WebSocket both become statements about frames: every client frame's
+   segment is fsync'd (and a create's inflight manifest written) before it goes
+   upstream, the 101 is recorded before the client sees it, and terminal events
+   and interrupt acknowledgements are held until the turn commits. A barrier
+   failure closes both legs *without* a close frame. After a failed append the
+   log is never appended to or sealed again; the `.gxl` is left for recovery.
 3. **Manifests are the source of truth.** `index.db` is a projection and must
    stay deletable-and-rebuildable. Never put data only in SQLite. A manifest is
    still authoritative once the sweep folds it into a `.gxm` pack — `EachID` and
@@ -353,16 +373,31 @@ path may need them to be right in order to fail safely.
   round-trip and the archive-name migration. Both copy the store to a `t.TempDir()`
   before touching anything, so they are safe to point at a live `~/.goxray`.
 - Subcommands take no `--home`: `runCLI` calls `config.Load(nil)`, so `goxray ls |
-  show | raw | archive | fsck | migrate-usage` always operate on `~/.goxray`.
-  `--home` only works on `serve`, and `goxray --home X archive` silently *starts a
-  server* (an unrecognised first arg falls through to serve). Point the fixture
-  tests at another store instead.
+  show | raw | archive | fsck | migrate-usage` operate on `$GOXRAY_HOME`, default
+  `~/.goxray`. `--home` only works on `serve`, and `goxray --home X archive`
+  silently *starts a server* (an unrecognised first arg falls through to serve).
+  Use `GOXRAY_HOME=<scratch home> goxray fsck` for a scratch store.
 
 ---
 
 ## TODOs
 
 ### Known gaps in what shipped
+
+- **Codex: the interrupt-acknowledgement path is unit-tested only.** Codex 0.164
+  sends the waiting kind of `response.interrupt` only from guardian-v2's
+  sampler; a user's Esc drops the socket instead. Rotation, ranges and holds
+  around `response.interrupt.accepted` are covered by
+  `TestStreamInterruptAckExtendsTheTurn`, not by live traffic.
+- **Codex: HTTP fallback and `codex resume` were not exercised live.** No
+  config forces the fallback; the 426 relay and the HTTP terminal-frame hold are
+  unit-tested.
+- **Codex: no context window.** A Responses request does not say which window
+  the client works against, so `ctx_window` is 0 (unknown). The recorded
+  `GET …/models` response reports it and is the obvious source.
+- **Codex: a turn recorded before the range fix fails `fsck`** with "range stops
+  short". Only stores that ran the pre-review build have one; the bytes are all
+  there, only the manifest's `last` is low.
 
 - **Turn titles are mostly empty.** Only Claude Code's title-generation turns
   populate `res.title`. A first-user-message excerpt would be a better fallback.
@@ -458,8 +493,6 @@ path may need them to be right in order to fail safely.
   thing it loses is inflight rows.
 - Live pricing (ccxray fetches LiteLLM with a 24h cache). The fallback table has
   the same shape, so callers would not change.
-- OpenAI HTTP support: a new `WireParser` plus a `Classify` rule.
-- Codex WebSocket: a new `Transport` emitting the same `Exchange`.
 - Content-addressed blob dedup: a new `BlobStore` backend, ref stays opaque.
 - Hub / intercept modes.
 
