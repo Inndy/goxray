@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -76,6 +77,9 @@ func serve(args []string) error {
 	defer sweeper.Stop()
 
 	srv := proxy.New(cfg, st.Recorder)
+	srv.SetStreams(func(conn *model.Exchange) (proxy.StreamLog, error) {
+		return st.Recorder.OpenStream(conn)
+	})
 	httpSrv := &http.Server{Addr: srv.Addr(), Handler: srv.Handler()}
 
 	log.Printf("goxray listening on http://%s", srv.Addr())
@@ -85,6 +89,7 @@ func serve(args []string) error {
 		log.Printf("archiving sessions idle for %s", cfg.ArchiveAfter)
 	}
 	log.Printf("point Claude Code at it:  export %s", cfg.BaseURLLine())
+	log.Printf("point Codex at it:        %s  (in ~/.codex/config.toml)", cfg.CodexLine())
 
 	// Graceful shutdown: stop accepting, drain the index queue, mark clean.
 	errCh := make(chan error, 1)
@@ -118,12 +123,20 @@ func serve(args []string) error {
 	// deserve every second. The dashboard is hard-closed — its SSE streams never
 	// go idle, so a graceful Shutdown would just burn the deadline waiting on
 	// them (and previously starved the proxy of it).
+	//
+	// WebSockets drain alongside HTTP, not after it: Shutdown does not wait for
+	// hijacked connections, and one long SSE turn must not spend their share of
+	// the deadline before they are even asked to close.
 	shutdown := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		dl, _ := ctx.Deadline()
+		var wg sync.WaitGroup
+		wg.Go(func() { srv.CloseStreams(dl) })
 		if err := httpSrv.Shutdown(ctx); err != nil {
 			log.Printf("goxray: proxy shutdown: %v (a stream may still be mid-turn)", err)
 		}
+		wg.Wait()
 		if uiSrv != nil {
 			_ = uiSrv.Close()
 		}
@@ -131,6 +144,9 @@ func serve(args []string) error {
 
 	select {
 	case err := <-errCh:
+		// The listener died, but sockets it already handed over are still
+		// recording into the store about to close.
+		srv.CloseStreams(time.Now().Add(5 * time.Second))
 		if uiSrv != nil {
 			_ = uiSrv.Close()
 		}

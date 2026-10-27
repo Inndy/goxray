@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.inndy.tw/goxray/internal/model"
+	"go.inndy.tw/goxray/internal/wire"
 )
 
 // idleTimeout bounds how long an in-flight response may stall with no bytes
@@ -29,7 +30,7 @@ type httpTransport struct{}
 //  2. forward with identity encoding;
 //  3. stream the response, holding back terminal SSE frames until the response
 //     is durably committed — else abort the connection.
-func (t *httpTransport) Handle(w http.ResponseWriter, r *http.Request, up *url.URL, source string, rec Recorder, client *http.Client, maxBody int64) error {
+func (t *httpTransport) Handle(w http.ResponseWriter, r *http.Request, provider model.Provider, up *url.URL, source string, rec Recorder, client *http.Client, maxBody int64) error {
 	// ── request ──────────────────────────────────────────────
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
@@ -49,6 +50,7 @@ func (t *httpTransport) Handle(w http.ResponseWriter, r *http.Request, up *url.U
 	}
 	ex := rec.NewExchange(r.Method, reqURI, r.Header)
 	ex.Source = source
+	ex.Provider = provider
 	if err := rec.PersistRequest(ex, body); err != nil {
 		// Fail-closed: we could not durably record the request, so it must not
 		// reach the API. This is the only 502 that precedes forwarding.
@@ -81,7 +83,7 @@ func (t *httpTransport) Handle(w http.ResponseWriter, r *http.Request, up *url.U
 	ex.ResHeaders = curateResHeaders(resp.Header)
 
 	if isSSE(resp.Header.Get("content-type")) {
-		return t.streamSSE(w, resp, ex, rec, timer, &timedOut)
+		return t.streamSSE(w, resp, ex, rec, timer, &timedOut, terminalFor(provider))
 	}
 	return t.bufferNonSSE(w, resp, ex, rec, &timedOut)
 }
@@ -102,7 +104,7 @@ func (t *httpTransport) finalizeNoResponse(w http.ResponseWriter, ex *model.Exch
 // terminal message_delta/message_stop frames, commits the response durably, then
 // releases the held frames. A commit failure aborts the connection (no clean
 // terminating chunk) so the client sees an unexpected EOF.
-func (t *httpTransport) streamSSE(w http.ResponseWriter, resp *http.Response, ex *model.Exchange, rec Recorder, timer *time.Timer, timedOut *atomic.Bool) error {
+func (t *httpTransport) streamSSE(w http.ResponseWriter, resp *http.Response, ex *model.Exchange, rec Recorder, timer *time.Timer, timedOut *atomic.Bool, isTerminalFrame func([]byte) bool) error {
 	flusher, _ := w.(http.Flusher)
 	copyRespHeaders(w.Header(), resp.Header)
 	w.WriteHeader(ex.Status)
@@ -288,6 +290,27 @@ func isTerminalFrame(frame []byte) bool {
 		bytes.Contains(frame, tokEvtStop) || bytes.Contains(frame, tokEvtDelta)
 }
 
+// isResponsesTerminalFrame is isTerminalFrame for the Responses API, whose
+// stream ends in response.completed, .failed, .incomplete, or an error event.
+// Decided from the frame's own data rather than by substring, because unlike
+// Anthropic's terminal frames these carry the whole response — model output
+// included — and a substring test could match text the model wrote.
+func isResponsesTerminalFrame(frame []byte) bool {
+	terminal := false
+	wire.SplitSSEData(frame, func(payload []byte) bool {
+		terminal = wire.IsTerminalEvent(wire.EventType(payload))
+		return !terminal
+	})
+	return terminal
+}
+
+func terminalFor(p model.Provider) func([]byte) bool {
+	if p == model.ProviderOpenAI {
+		return isResponsesTerminalFrame
+	}
+	return isTerminalFrame
+}
+
 func writeFrame(w http.ResponseWriter, f http.Flusher, frame []byte) error {
 	if _, err := w.Write(frame); err != nil {
 		return err
@@ -355,7 +378,9 @@ func curateResHeaders(h http.Header) map[string]string {
 	for k, vs := range h {
 		lk := strings.ToLower(k)
 		if lk == "request-id" || lk == "retry-after" || lk == "content-type" ||
-			strings.HasPrefix(lk, "anthropic-ratelimit-") || strings.HasPrefix(lk, "anthropic-") {
+			strings.HasPrefix(lk, "anthropic-ratelimit-") || strings.HasPrefix(lk, "anthropic-") ||
+			lk == "x-request-id" || lk == "openai-model" || lk == "openai-processing-ms" ||
+			strings.HasPrefix(lk, "x-codex-") || strings.HasPrefix(lk, "x-ratelimit-") {
 			if len(vs) > 0 {
 				out[lk] = vs[0]
 			}

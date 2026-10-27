@@ -23,13 +23,17 @@ const DefaultArchiveAfter = 30 * time.Minute
 
 // Config is the resolved runtime configuration.
 type Config struct {
-	Host         string   // expose proxy port?
-	Port         int
-	UIPort       int      // dashboard port; 0 disables it entirely
-	Home         string   // $GOXRAY_HOME, default ~/.goxray
-	Upstream     *url.URL // resolved upstream base (scheme://host:port)
-	MaxBodyBytes int64
-	NoBrowser    bool // reserved; MVP has no browser
+	Host     string // expose proxy port?
+	Port     int
+	UIPort   int      // dashboard port; 0 disables it entirely
+	Home     string   // $GOXRAY_HOME, default ~/.goxray
+	Upstream *url.URL // resolved upstream base (scheme://host:port)
+	// ChatGPTUpstream serves Codex under ChatGPT sign-in (/backend-api/...);
+	// OpenAIUpstream serves it under an API key (/v1/responses).
+	ChatGPTUpstream *url.URL
+	OpenAIUpstream  *url.URL
+	MaxBodyBytes    int64
+	NoBrowser       bool // reserved; MVP has no browser
 
 	// ArchiveAfter is the idle window before a session is archived; 0 disables
 	// archiving entirely.
@@ -55,6 +59,10 @@ func Load(args []string) (*Config, error) {
 	home := fs.String("home", envStr("GOXRAY_HOME", ""), "data directory (default ~/.goxray)")
 	maxBodyMB := fs.Int("max-body-mb", envInt("GOXRAY_MAX_BODY_MB", 50), "max request body size in MiB")
 	upstream := fs.String("upstream", envStr("GOXRAY_UPSTREAM", ""), "override upstream base URL")
+	chatgptUp := fs.String("chatgpt-upstream", envStr("GOXRAY_CHATGPT_UPSTREAM", "https://chatgpt.com"),
+		"upstream for Codex under ChatGPT sign-in")
+	openaiUp := fs.String("openai-upstream", envStr("GOXRAY_OPENAI_UPSTREAM", "https://api.openai.com"),
+		"upstream for Codex under an API key")
 	archiveAfter := fs.Duration("archive-after", envDur("GOXRAY_ARCHIVE_AFTER", DefaultArchiveAfter),
 		"fold sessions idle this long into archives (0 = never)")
 	if err := fs.Parse(args); err != nil {
@@ -88,6 +96,12 @@ func Load(args []string) (*Config, error) {
 		return nil, err
 	}
 	c.Upstream = up
+	if c.ChatGPTUpstream, err = url.Parse(*chatgptUp); err != nil {
+		return nil, fmt.Errorf("--chatgpt-upstream: %w", err)
+	}
+	if c.OpenAIUpstream, err = url.Parse(*openaiUp); err != nil {
+		return nil, fmt.Errorf("--openai-upstream: %w", err)
+	}
 	return c, nil
 }
 
@@ -108,6 +122,13 @@ func resolveUpstream(explicit string) (*url.URL, error) {
 // BaseURLLine returns the export line the user should set for Claude Code.
 func (c *Config) BaseURLLine() string {
 	return fmt.Sprintf("ANTHROPIC_BASE_URL=http://localhost:%d", c.Port)
+}
+
+// CodexLine returns the config.toml line that points Codex at goxray. The path
+// must end in /backend-api/codex: that is what keeps Codex treating the
+// endpoint as its own backend rather than a generic provider.
+func (c *Config) CodexLine() string {
+	return fmt.Sprintf(`openai_base_url = "http://localhost:%d/backend-api/codex"`, c.Port)
 }
 
 func (c *Config) BlobsDir() string     { return filepath.Join(c.Home, "blobs") }
