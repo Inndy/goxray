@@ -10,20 +10,48 @@ import "time"
 
 // CaptureVersion is stamped into every manifest so a future format change is a
 // clean migration rather than a guess. Bump when the on-disk contract changes.
-const CaptureVersion = 1
+//
+// 2: a WebSocket turn has no body refs of its own — its bytes are a range of
+// its connection's log (see WSRef) — which a v1 reader would misread as "not
+// recorded".
+const CaptureVersion = 2
 
-// Provider identifies the upstream API family. MVP records only Anthropic.
+// Provider identifies the upstream API family.
 type Provider string
 
-const ProviderAnthropic Provider = "anthropic"
+const (
+	ProviderAnthropic Provider = "anthropic"
+	// ProviderOpenAI is the Responses API, as Codex speaks it to either the
+	// ChatGPT backend or api.openai.com.
+	ProviderOpenAI Provider = "openai"
+)
 
-// Transport identifies how bytes flowed. MVP is HTTP only.
-type Transport int
+// Transport identifies how an exchange's bytes flowed. The empty value is HTTP,
+// so every manifest written before WebSocket support reads correctly.
+type Transport string
 
 const (
-	TransportHTTP Transport = iota
-	TransportWS
+	TransportHTTP Transport = ""
+	TransportWS   Transport = "ws"
 )
+
+// Kinds of exchange that are not a model turn. Empty is an ordinary turn.
+const (
+	// KindWSConn is a WebSocket connection itself: the HTTP upgrade, whose
+	// response body is the connection's frame log.
+	KindWSConn = "ws-conn"
+)
+
+// WSRef places a WebSocket turn inside its connection's log. The log is the
+// verbatim record; a turn is the range from its response.create to its
+// terminal event, and its full prompt is the fold of everything before it on
+// the same connection.
+type WSRef struct {
+	Conn  string `json:"conn"`  // the connection exchange's id
+	Log   string `json:"log"`   // blob ref of the connection log
+	First int64  `json:"first"` // record number of the response.create
+	Last  int64  `json:"last"`  // record number of the terminal event, or the last one recorded
+}
 
 // ExchangeState is the terminal (or inflight) disposition of an exchange. Every
 // request that reaches the API is represented on disk as exactly one of these —
@@ -74,6 +102,19 @@ type ReqMeta struct {
 	// `goxray migrate-usage` recovers it from the stored request blobs.
 	CtxWindow  int  `json:"ctx_window,omitempty"`
 	IsSubagent bool `json:"is_subagent"`
+
+	// Thread, ParentThread and Agent identify which agent inside a session made
+	// the call. Codex runs sub-agents, reviewers and classifiers as their own
+	// threads under the root session id, so the session alone cannot tell them
+	// apart. Kind is the client's own label for the request (Codex:
+	// turn|prewarm|compaction|memory). All empty for Claude Code.
+	Thread       string `json:"thread,omitempty"`
+	ParentThread string `json:"parent_thread,omitempty"`
+	Agent        string `json:"agent,omitempty"`
+	Kind         string `json:"kind,omitempty"`
+	// PrevResponseID is set when the request continued an earlier response
+	// instead of resending the conversation.
+	PrevResponseID string `json:"prev_response_id,omitempty"`
 }
 
 // ResMeta is best-effort metadata parsed from the response.
@@ -87,6 +128,9 @@ type ResMeta struct {
 	// ServiceTier scales the rate: batch is half price. Empty on older captures,
 	// treated as standard.
 	ServiceTier string `json:"service_tier,omitempty"`
+	// ResponseID is the id the API gave this response; a later request may
+	// continue from it by id.
+	ResponseID string `json:"response_id,omitempty"`
 	// Cost is derived on read, never persisted. Rate tables change (a model can
 	// be unpriced when recorded and priced later), so the manifest stores only
 	// the token counts and every read reprices from them; a figure frozen at
@@ -100,10 +144,15 @@ type ResMeta struct {
 // The manifest carries all parsed metadata so the index can be rebuilt from
 // manifests alone — the raw blobs are never re-parsed for a rebuild.
 type Exchange struct {
-	ID         string        `json:"id"` // uuidv7 — time-sortable
-	Provider   Provider      `json:"provider"`
-	CaptureVer int           `json:"capture_ver"`
-	State      ExchangeState `json:"state"`
+	ID         string    `json:"id"` // uuidv7 — time-sortable
+	Provider   Provider  `json:"provider"`
+	CaptureVer int       `json:"capture_ver"`
+	Transport  Transport `json:"transport,omitempty"`
+	// Kind is empty for a model turn; see KindWSConn.
+	Kind string `json:"kind,omitempty"`
+	// WS is set on a WebSocket turn, whose ReqRef and ResRef are empty.
+	WS    *WSRef        `json:"ws,omitempty"`
+	State ExchangeState `json:"state"`
 	// Source is a caller-declared origin label, taken from a leading URL path
 	// slug (ANTHROPIC_BASE_URL=http://host:port/<slug>). It lets one goxray
 	// separate traffic by project / agent-group (single-user) or by user/tenant
@@ -139,5 +188,8 @@ func (e *Exchange) RequestID() string {
 	if e.ResHeaders == nil {
 		return ""
 	}
-	return e.ResHeaders["request-id"]
+	if id := e.ResHeaders["request-id"]; id != "" {
+		return id
+	}
+	return e.ResHeaders["x-request-id"] // OpenAI's name for it
 }
