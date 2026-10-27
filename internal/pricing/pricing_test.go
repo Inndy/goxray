@@ -153,3 +153,52 @@ func TestCacheWrite1hCostsMoreThan5m(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenAIIdsDoNotShadowEachOther(t *testing.T) {
+	// gpt-6-sol and gpt-6.1-sol share input and output rates but not the cached
+	// rate; a loose prefix would bill one at the other's.
+	a, _ := lookup("gpt-6.1-sol")
+	b, _ := lookup("gpt-6-sol")
+	if a.cacheRead != 0.10 || b.cacheRead != 0.20 {
+		t.Fatalf("cached rates: 6.1-sol %v, 6-sol %v", a.cacheRead, b.cacheRead)
+	}
+	if Known("gpt-6") || Known("gpt-daybreak-blue-latest") || Known("codex-auto-review") {
+		t.Error("an unpriced OpenAI id resolved to a rate")
+	}
+}
+
+func TestOpenAILongContextBillsWholeRequest(t *testing.T) {
+	short := model.Usage{InputTokens: 200_000, CacheReadTokens: 72_000, OutputTokens: 1_000}
+	long := model.Usage{InputTokens: 200_000, CacheReadTokens: 72_001, OutputTokens: 1_000}
+	// 200K*$2 + 72K*$0.10 + 1K*$10, then the same counts at $4/$0.20/$15.
+	if got, want := Calc(short, "gpt-6.1-sol"), 0.4+0.0072+0.01; math.Abs(got-want) > 1e-9 {
+		t.Errorf("short context: %v, want %v", got, want)
+	}
+	if got, want := Calc(long, "gpt-6.1-sol"), 0.8+0.0144002+0.015; math.Abs(got-want) > 1e-9 {
+		t.Errorf("long context: %v, want %v", got, want)
+	}
+}
+
+func TestOpenAITiers(t *testing.T) {
+	u := model.Usage{InputTokens: 100_000} // short context: $0.20 at Standard
+	for tier, want := range map[string]float64{"default": 0.2, "flex": 0.1, "priority": 0.4, "fast": 0.4, "ultrafast": 1.2} {
+		if got := Price(model.ResMeta{Usage: u, Model: "gpt-6.1-sol", ServiceTier: tier}, ""); math.Abs(got-want) > 1e-9 {
+			t.Errorf("%s: %v, want %v", tier, got, want)
+		}
+	}
+	// Anthropic's priority stays unscaled.
+	if got := Price(model.ResMeta{Usage: u, Model: "claude-opus-5", ServiceTier: "priority"}, ""); math.Abs(got-0.5) > 1e-9 {
+		t.Errorf("claude priority: %v, want 0.5", got)
+	}
+}
+
+// The worked example from OpenAI's prompt-caching guide, on a model whose rates
+// match it ($1 input): 1,000 plain, 4,000 cached, 3,000 written for 30 minutes
+// and 4,000 for 12 hours.
+func TestOpenAICacheWritesBillByLifetime(t *testing.T) {
+	u := model.Usage{InputTokens: 1000, CacheReadTokens: 4000, CacheCreateTokens: 7000, CacheCreate5m: 3000, CacheCreate1h: 4000}
+	// 1000×1 + 4000×0.05 + 3000×1.25 + 4000×2.5, per million.
+	if got, want := Calc(u, "gpt-6.1-terra"), 0.01495; math.Abs(got-want) > 1e-12 {
+		t.Fatalf("cost %v, want %v", got, want)
+	}
+}
