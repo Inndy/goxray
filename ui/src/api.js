@@ -24,6 +24,7 @@ async function getJSON(path) {
 
 export const fetchSessions = (opts = {}) => getJSON(`/api/sessions${qs(opts)}`)
 export const fetchExchanges = (opts = {}) => getJSON(`/api/exchanges${qs(opts)}`)
+export const fetchThreads = (opts = {}) => getJSON(`/api/threads${qs(opts)}`)
 export const fetchExchange = (id) => getJSON(`/api/exchange/${encodeURIComponent(id)}`)
 export const rawURL = (id, side) => `/api/exchange/${encodeURIComponent(id)}/raw?side=${side}`
 

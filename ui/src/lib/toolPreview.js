@@ -44,6 +44,16 @@ export function toolPreview(name, input) {
       return truncate(inp.description, 48)
     case 'AskUserQuestion':
       return truncate(inp.questions?.[0]?.question, 56)
+    // Codex's multi-agent tools. The task text itself is encrypted by the API,
+    // so the name of the agent it goes to is the only readable identifier.
+    case 'spawn_agent':
+      return String(inp.task_name ?? '')
+    case 'send_message':
+    case 'followup_task':
+    case 'close_agent':
+      return String(inp.target ?? '')
+    case 'wait_agent':
+      return [].concat(inp.targets ?? inp.target ?? []).join(', ')
     default: {
       const first = Object.keys(inp)[0]
       if (!first) return ''

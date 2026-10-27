@@ -104,6 +104,14 @@ export function startedMs(ex) {
   return ex?.started_at ? Date.parse(ex.started_at) : 0
 }
 
+// An inflight turn's ended_at is Go's zero time, 0001-01-01, not absent; read
+// as a date it puts the turn's end two thousand years in the past. Any end not
+// after the start is no end.
+export function endedMs(ex) {
+  const end = ex?.ended_at ? Date.parse(ex.ended_at) : 0
+  return end > startedMs(ex) ? end : 0
+}
+
 export function elapsedMs(ex) {
   if (!ex?.started_at || !ex?.ended_at) return 0
   const d = Date.parse(ex.ended_at) - Date.parse(ex.started_at)

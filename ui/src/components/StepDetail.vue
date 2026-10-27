@@ -1,9 +1,11 @@
 <script setup>
 import { computed } from 'vue'
-import { NAlert, NEmpty, NTag } from 'naive-ui'
+import { useRouter } from 'vue-router'
+import { NAlert, NButton, NEmpty, NTag } from 'naive-ui'
 import { prettyJSON } from '@/lib/format.js'
 import { resultImages, resultText } from '@/lib/mergeSteps.js'
 import { imageDataURL } from '@/lib/safe.js'
+import { focusThread, store, threadOfAgent } from '@/store.js'
 import SafeText from './SafeText.vue'
 
 const props = defineProps({
@@ -19,6 +21,24 @@ const call = computed(() => {
 const outText = computed(() => (call.value ? resultText(call.value.result) : ''))
 const outImages = computed(() => (call.value ? resultImages(call.value.result) : []))
 const lineCount = computed(() => (outText.value ? outText.value.split('\n').length : 0))
+
+// Codex's multi-agent calls name another agent. Following one should land on
+// that agent's own turns, which is the step a reader tracking a sub-agent takes
+// next: from "spawned count_go" to what count_go then did.
+const AGENT_CALLS = ['spawn_agent', 'send_message', 'followup_task', 'close_agent']
+const router = useRouter()
+const agentTarget = computed(() => {
+  const c = call.value
+  if (!c || !AGENT_CALLS.includes(c.name)) return null
+  const name = c.input?.task_name || c.input?.target || ''
+  // Relative names resolve against the agent that made the call, as in Codex.
+  const from = store.detail?.exchange?.req?.agent
+  return name ? { name, thread: threadOfAgent(name, from) } : null
+})
+async function openAgent() {
+  const id = await focusThread(agentTarget.value.thread)
+  if (id) router.push({ name: 'turn', params: { session: store.selectedSession || '-', id } })
+}
 
 const paragraphs = (t) =>
   String(t ?? '')
@@ -45,6 +65,14 @@ const paragraphs = (t) =>
         <span class="id mono">{{ call.toolUseId }}</span>
       </div>
       <div v-if="call.preview" class="preview mono">{{ call.preview }}</div>
+      <div v-if="agentTarget" class="jump">
+        <NButton size="tiny" :disabled="!agentTarget.thread" @click="openAgent">
+          open agent {{ agentTarget.name }} →
+        </NButton>
+        <span v-if="!agentTarget.thread" class="muted">
+          not found in this session, or more than one agent has this name
+        </span>
+      </div>
 
       <h4>
         Input
@@ -244,5 +272,12 @@ h4 .muted {
 }
 .muted {
   color: var(--gx-dim);
+}
+.jump {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  font-size: 11px;
 }
 </style>

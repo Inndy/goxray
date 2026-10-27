@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -18,11 +19,19 @@ const testPort = 5600
 type fakeReader struct {
 	rows     []model.Exchange
 	sessions []store.Session
+	threads  []store.Thread
+	order    []store.Ordered
 	blobs    map[string][]byte
 }
 
 func (f *fakeReader) Query(store.Filter) ([]model.Exchange, error)   { return f.rows, nil }
 func (f *fakeReader) Sessions(store.Filter) ([]store.Session, error) { return f.sessions, nil }
+func (f *fakeReader) Threads(string) ([]store.Thread, []store.Ordered, error) {
+	return f.threads, f.order, nil
+}
+func (f *fakeReader) Page(store.Filter) ([]model.Exchange, []store.Ordered, error) {
+	return f.rows, f.order, nil
+}
 
 func (f *fakeReader) Manifest(id string) (*model.Exchange, error) {
 	for i := range f.rows {
@@ -401,6 +410,142 @@ func TestSessionsMergesInflight(t *testing.T) {
 	}
 }
 
+// A thread filter must hide another agent's streaming turn exactly as the index
+// query hides its committed ones.
+func TestExchangesInflightRespectsThreadFilter(t *testing.T) {
+	rd := newTestReader()
+	hub := NewHub()
+	now := time.Now().UTC()
+	hub.OnExchange(model.Exchange{ID: "live-root", State: model.StateInflight, StartedAt: now,
+		Req: model.ReqMeta{SessionID: "s1", Thread: "t-root"}})
+	hub.OnExchange(model.Exchange{ID: "live-child", State: model.StateInflight, StartedAt: now,
+		Req: model.ReqMeta{SessionID: "s1", Thread: "t-child"}})
+	h := Handler(rd, hub, testPort)
+
+	w := do(t, h, "GET", "/api/exchanges?session=s1&thread=t-child", nil)
+	var got struct{ Exchanges []model.Exchange }
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range got.Exchanges {
+		if e.ID == "live-root" {
+			t.Errorf("another thread's inflight turn leaked through the filter")
+		}
+	}
+	if !slices.ContainsFunc(got.Exchanges, func(e model.Exchange) bool { return e.ID == "live-child" }) {
+		t.Errorf("the filtered thread's inflight turn is missing: %+v", got.Exchanges)
+	}
+}
+
+// The agent summary marks a thread running while one of its turns streams, and
+// shows a thread whose first turn has not committed yet.
+func TestThreadsOverlaysInflight(t *testing.T) {
+	rd := newTestReader()
+	rd.threads = []store.Thread{{Thread: "t-root", Agent: "/root", Turns: 3, FirstTS: 1}}
+	hub := NewHub()
+	now := time.Now().UTC()
+	hub.OnExchange(model.Exchange{ID: "live-child", State: model.StateInflight, StartedAt: now,
+		Req: model.ReqMeta{SessionID: "s1", Thread: "t-child", ParentThread: "t-root", Agent: "/root/task"}})
+	hub.OnExchange(model.Exchange{ID: "live-other", State: model.StateInflight, StartedAt: now,
+		Req: model.ReqMeta{SessionID: "s2", Thread: "t-elsewhere"}})
+	h := Handler(rd, hub, testPort)
+
+	var got struct{ Threads []store.Thread }
+	w := do(t, h, "GET", "/api/threads?session=s1", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Threads) != 2 || got.Threads[0].Thread != "t-root" || got.Threads[0].Running {
+		t.Fatalf("threads = %+v", got.Threads)
+	}
+	c := got.Threads[1]
+	if c.Thread != "t-child" || !c.Running || c.Turns != 1 || c.LastState != "inflight" || c.ParentThread != "t-root" {
+		t.Errorf("inflight child = %+v", c)
+	}
+}
+
+// A session listing says where each row stands in the whole session, so a page
+// of the newest turns, or one thread's, is not numbered from 1.
+func TestExchangesCarrySessionOrdinals(t *testing.T) {
+	rd := newTestReader()
+	rd.order = []store.Ordered{{ID: "older", TS: 1}, {ID: "ex1", TS: 2}}
+	h := Handler(rd, nil, testPort)
+	var got struct {
+		Seq    map[string]int `json:"seq"`
+		SeqMax int            `json:"seq_max"`
+	}
+	w := do(t, h, "GET", "/api/exchanges?session=s1", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Seq["ex1"] != 2 || len(got.Seq) != 1 || got.SeqMax != 2 {
+		t.Errorf("seq = %v, max %d; want only the rows sent, and the session's count", got.Seq, got.SeqMax)
+	}
+}
+
+// A turn that has finished but whose index row is not written yet is neither
+// inflight nor indexed. The summary must still count it, and a listing must
+// still number it in start order among the others, not after them.
+func TestThreadsAndSeqCountTheNotYetIndexed(t *testing.T) {
+	rd := newTestReader()
+	t0 := time.UnixMilli(1_000_000).UTC()
+	rd.threads = []store.Thread{{Thread: "t-root", Agent: "/root", Turns: 1, Cost: 1, FirstTS: 1, LastState: "complete", LastTurnTS: t0.Add(2 * time.Second).UnixMilli()}}
+	rd.order = []store.Ordered{{ID: "ex1", TS: t0.Add(2 * time.Second).UnixMilli()}}
+	hub := NewHub()
+	early := model.Exchange{ID: "early", State: model.StateInflight, StartedAt: t0.Add(time.Second),
+		Req: model.ReqMeta{SessionID: "s1", Thread: "t-child", ParentThread: "t-root", Agent: "/root/task"}}
+	hub.OnExchange(early)
+	early.State, early.EndedAt, early.Res.Cost = model.StateComplete, t0.Add(3*time.Second), 0.5
+	hub.OnExchange(early) // committed; the index has not written it
+	h := Handler(rd, hub, testPort)
+
+	var th struct{ Threads []store.Thread }
+	if err := json.Unmarshal(do(t, h, "GET", "/api/threads?session=s1", nil).Body.Bytes(), &th); err != nil {
+		t.Fatal(err)
+	}
+	if len(th.Threads) != 2 || th.Threads[1].Turns != 1 || th.Threads[1].Cost != 0.5 ||
+		th.Threads[1].LastState != "complete" || th.Threads[1].Running {
+		t.Fatalf("threads = %+v", th.Threads)
+	}
+
+	var ex struct {
+		Exchanges []model.Exchange
+		Seq       map[string]int `json:"seq"`
+	}
+	if err := json.Unmarshal(do(t, h, "GET", "/api/exchanges?session=s1", nil).Body.Bytes(), &ex); err != nil {
+		t.Fatal(err)
+	}
+	if ex.Seq["early"] != 1 || ex.Seq["ex1"] != 2 {
+		t.Errorf("seq = %v, want the earlier-started turn first", ex.Seq)
+	}
+	if !slices.ContainsFunc(ex.Exchanges, func(e model.Exchange) bool { return e.ID == "early" }) {
+		t.Errorf("the not-yet-indexed turn is missing from the listing")
+	}
+	// Filtered to another thread, the not-yet-indexed turn is not listed but
+	// still has its number, since seq_max counts it.
+	ex.Seq = nil
+	if err := json.Unmarshal(do(t, h, "GET", "/api/exchanges?session=s1&thread=t-root", nil).Body.Bytes(), &ex); err != nil {
+		t.Fatal(err)
+	}
+	if ex.Seq["early"] != 1 {
+		t.Errorf("filtered seq = %v, want the hidden pending turn numbered", ex.Seq)
+	}
+
+	// Once the index has it, it is counted once.
+	rd.threads[0].Turns = 1
+	rd.threads = append(rd.threads, store.Thread{Thread: "t-child", ParentThread: "t-root", Agent: "/root/task", Turns: 1, Cost: 0.5, FirstTS: 2})
+	rd.order = append(rd.order, store.Ordered{ID: "early", TS: t0.Add(time.Second).UnixMilli()})
+	th.Threads = nil
+	if err := json.Unmarshal(do(t, h, "GET", "/api/threads?session=s1", nil).Body.Bytes(), &th); err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range th.Threads {
+		if x.Thread == "t-child" && x.Turns != 1 {
+			t.Errorf("indexed and settled counted twice: %+v", x)
+		}
+	}
+}
+
 // A noise turn must not conjure a session the pane is filtered to hide.
 func TestSessionsInflightRespectsNoiseFilter(t *testing.T) {
 	rd := newTestReader()
@@ -426,6 +571,21 @@ func TestSessionsInflightRespectsNoiseFilter(t *testing.T) {
 	}
 	if len(got.Sessions) != 2 {
 		t.Errorf("noise=1 should show it: %+v", got.Sessions)
+	}
+}
+
+// A proxy nobody is watching never reads the hub, so finished exchanges must be
+// let go on the write side too, or the hub keeps every exchange it ever saw.
+func TestHubPrunesSettledWithoutReaders(t *testing.T) {
+	hub := NewHub()
+	hub.settled["old"] = settledExchange{at: time.Now().Add(-2 * settledTTL)}
+	hub.pruned = time.Now().Add(-2 * settledPruneEvery)
+	hub.OnExchange(model.Exchange{ID: "new", State: model.StateComplete, StartedAt: time.Now()})
+	if _, ok := hub.settled["old"]; ok {
+		t.Error("an expired settled exchange survived a write")
+	}
+	if _, ok := hub.settled["new"]; !ok {
+		t.Error("the finished exchange was not kept")
 	}
 }
 

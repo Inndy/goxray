@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -33,7 +34,7 @@ CREATE TABLE IF NOT EXISTS entries(
   cost REAL, status INT, stop_reason TEXT, cwd TEXT, is_subagent INT,
   title TEXT, elapsed_ms INT, ratelimit TEXT,
   req_ref TEXT, res_ref TEXT, parse_ok INT,
-  transport TEXT, kind TEXT, conn TEXT, thread TEXT, agent TEXT, req_kind TEXT
+  transport TEXT, kind TEXT, conn TEXT, thread TEXT, parent_thread TEXT, agent TEXT, req_kind TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_session ON entries(session, ts);
 CREATE INDEX IF NOT EXISTS idx_source ON entries(source, ts);
@@ -44,18 +45,34 @@ INSERT OR REPLACE INTO entries(
   id,ts,capture_ver,state,provider,source,session,is_noise,method,url,request_id,
   model,msg_count,tool_count,ctx_window,input_tokens,output_tokens,cache_read,cache_create,
   cost,status,stop_reason,cwd,is_subagent,title,elapsed_ms,ratelimit,req_ref,res_ref,parse_ok,
-  transport,kind,conn,thread,agent,req_kind)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  transport,kind,conn,thread,parent_thread,agent,req_kind)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 // Filter narrows a Query. Since is a UnixMilli lower bound (exclusive), used by
 // the dashboard to fetch only what appeared after its last poll.
 type Filter struct {
-	Session      string
+	Session string
+	// Thread narrows to one agent's thread inside a Codex session.
+	Thread       string
 	Source       string
 	Limit        int
 	Offset       int
 	Since        int64
 	IncludeNoise bool
+}
+
+// Matches applies the same filter to an exchange that is not in the index yet:
+// the inflight overlay must hide exactly what the query would.
+func (f Filter) Matches(e *model.Exchange) bool {
+	switch {
+	case f.Session != "" && e.Req.SessionID != f.Session,
+		f.Thread != "" && e.Req.Thread != f.Thread,
+		f.Source != "" && e.Source != f.Source,
+		!f.IncludeNoise && e.IsNoise,
+		f.Since > 0 && e.StartedAt.UnixMilli() <= f.Since:
+		return false
+	}
+	return true
 }
 
 // where builds the shared WHERE clause for entry and session queries.
@@ -65,6 +82,10 @@ func (f Filter) where() (string, []any) {
 	if f.Session != "" {
 		parts = append(parts, "session = ?")
 		args = append(args, f.Session)
+	}
+	if f.Thread != "" {
+		parts = append(parts, "thread = ?")
+		args = append(args, f.Thread)
 	}
 	if f.Source != "" {
 		parts = append(parts, "source = ?")
@@ -209,7 +230,7 @@ func doUpsert(stmt *sql.Stmt, ex *model.Exchange) error {
 		ex.Res.Usage.CacheReadTokens, ex.Res.Usage.CacheCreateTokens,
 		ex.Res.Cost, ex.Status, ex.Res.StopReason, ex.Req.Cwd, b2i(ex.Req.IsSubagent),
 		ex.Res.Title, ex.ElapsedMS(), rateLimitJSON(ex), ex.ReqRef, ex.ResRef, b2i(ex.ParseOK),
-		string(ex.Transport), ex.Kind, wsConn(ex), ex.Req.Thread, ex.Req.Agent, ex.Req.Kind,
+		string(ex.Transport), ex.Kind, wsConn(ex), ex.Req.Thread, ex.Req.ParentThread, ex.Req.Agent, ex.Req.Kind,
 	)
 	return err
 }
@@ -237,9 +258,38 @@ func (i *Index) Sessions(f Filter) ([]Session, error) {
 const entryCols = `id,ts,capture_ver,state,provider,source,session,is_noise,method,url,request_id,
   model,msg_count,tool_count,ctx_window,input_tokens,output_tokens,cache_read,cache_create,
   cost,status,stop_reason,cwd,is_subagent,title,elapsed_ms,ratelimit,req_ref,res_ref,parse_ok,
-  transport,kind,conn,thread,agent,req_kind`
+  transport,kind,conn,thread,parent_thread,agent,req_kind`
 
-func queryEntries(db *sql.DB, f Filter) ([]model.Exchange, error) {
+// Page returns a listing and, for a listing inside one session, that session's
+// indexed turns in start order (SessionOrder), both from one read transaction.
+// The dashboard decides from the second which turns the index has not caught up
+// with; read separately, a row landing between the two would be in neither.
+func (i *Index) Page(f Filter) ([]model.Exchange, []Ordered, error) {
+	return pageSnapshot(i.db, f)
+}
+
+func pageSnapshot(db *sql.DB, f Filter) ([]model.Exchange, []Ordered, error) {
+	if f.Session == "" {
+		rows, err := queryEntries(db, f)
+		return rows, nil, err
+	}
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	rows, err := queryEntries(tx, f)
+	if err != nil {
+		return nil, nil, err
+	}
+	order, err := querySessionOrder(tx, f.Session, f.IncludeNoise)
+	if err != nil {
+		return nil, nil, err
+	}
+	return rows, order, nil
+}
+
+func queryEntries(db queryer, f Filter) ([]model.Exchange, error) {
 	where, args := f.where()
 	tail, tailArgs := f.limitOffset()
 	q := `SELECT ` + entryCols + ` FROM entries` + where + ` ORDER BY ts DESC` + tail
@@ -273,7 +323,7 @@ func scanEntry(rows *sql.Rows) (model.Exchange, error) {
 		&e.Res.Usage.CacheReadTokens, &e.Res.Usage.CacheCreateTokens,
 		&e.Res.Cost, &e.Status, &e.Res.StopReason, &e.Req.Cwd, &isSubagent,
 		&e.Res.Title, &elapsed, &ratelimit, &e.ReqRef, &e.ResRef, &parseOK,
-		&e.Transport, &e.Kind, &conn, &e.Req.Thread, &e.Req.Agent, &e.Req.Kind,
+		&e.Transport, &e.Kind, &conn, &e.Req.Thread, &e.Req.ParentThread, &e.Req.Agent, &e.Req.Kind,
 	); err != nil {
 		return e, err
 	}
@@ -367,6 +417,121 @@ func querySessions(db *sql.DB, f Filter) ([]Session, error) {
 			}
 		}
 		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// Thread is one agent's rollup inside a Codex session: sub-agents, reviewers and
+// guardians share the session id and are told apart by thread. Like Session it
+// is a GROUP BY, so it covers the whole session rather than whatever page of
+// turns a client happens to hold.
+type Thread struct {
+	Thread       string  `json:"thread"`
+	ParentThread string  `json:"parent_thread"`
+	Agent        string  `json:"agent"`
+	Turns        int     `json:"turns"` // noise (prewarms) excluded, as in a turn list
+	Cost         float64 `json:"cost"`
+	FirstTS      int64   `json:"first_ts"`
+	LastTS       int64   `json:"last_ts"` // when the thread was last active: its latest end
+	LastState    string  `json:"last_state"`
+	// LastTurnTS is when the latest real turn started — the one LastState is of.
+	LastTurnTS int64 `json:"-"`
+	// Running is set by the dashboard from the inflight overlay; an index row
+	// only exists once its turn has committed.
+	Running bool `json:"running"`
+}
+
+// Ordered is one indexed turn's place in its session.
+type Ordered struct {
+	ID string
+	TS int64
+}
+
+// SessionOrder lists a session's indexed turns in the order they started, over
+// the whole session: a client holding a capped page of the newest turns, or one
+// thread's, cannot number them itself without calling the oldest one it holds
+// #1. Noise is listed only when it is shown, as in a listing. It is also the
+// set of ids the index has, which is how the dashboard tells a committed turn
+// the index has not caught up with from one it already counts.
+func (i *Index) SessionOrder(session string, includeNoise bool) ([]Ordered, error) {
+	return querySessionOrder(i.db, session, includeNoise)
+}
+
+// queryer is what a read needs, so one can run alone or inside a snapshot.
+type queryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+func querySessionOrder(db queryer, session string, includeNoise bool) ([]Ordered, error) {
+	q := `SELECT id, ts FROM entries WHERE session = ?`
+	if !includeNoise {
+		q += ` AND is_noise = 0`
+	}
+	rows, err := db.Query(q+` ORDER BY ts, id`, session)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Ordered{}
+	for rows.Next() {
+		var o Ordered
+		if err := rows.Scan(&o.ID, &o.TS); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// Threads rolls one session's entries up by thread. Agent and parent are MAX
+// because a thread names them on most turns and leaves them empty on a few (a
+// memory turn on the root thread has no agent), and any name beats none.
+//
+// It also returns every turn of the session the rollup covers, read in the same
+// transaction: the dashboard adds what the index has not caught up with, and
+// with two separate reads a row landing between them would be counted twice or
+// not at all.
+func (i *Index) Threads(session string) ([]Thread, []Ordered, error) {
+	return threadsSnapshot(i.db, session)
+}
+
+func threadsSnapshot(db *sql.DB, session string) ([]Thread, []Ordered, error) {
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	threads, err := queryThreads(tx, session)
+	if err != nil {
+		return nil, nil, err
+	}
+	order, err := querySessionOrder(tx, session, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	return threads, order, nil
+}
+
+func queryThreads(db queryer, session string) ([]Thread, error) {
+	rows, err := db.Query(`SELECT thread, MAX(parent_thread), MAX(agent),
+	    SUM(CASE WHEN is_noise=0 THEN 1 ELSE 0 END),
+	    COALESCE(SUM(CASE WHEN is_noise=0 THEN cost END),0),
+	    MIN(ts), MAX(ts + elapsed_ms), COALESCE(MAX(CASE WHEN is_noise=0 THEN ts END),0),
+	    COALESCE((SELECT t.state FROM entries t WHERE t.session=e.session AND t.thread=e.thread
+	      AND t.is_noise=0 ORDER BY t.ts DESC LIMIT 1),'')
+	  FROM entries e WHERE session = ? AND thread != '' GROUP BY thread ORDER BY MIN(ts)`, session)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Thread{}
+	for rows.Next() {
+		var t Thread
+		if err := rows.Scan(&t.Thread, &t.ParentThread, &t.Agent, &t.Turns, &t.Cost,
+			&t.FirstTS, &t.LastTS, &t.LastTurnTS, &t.LastState); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
 	}
 	return out, rows.Err()
 }

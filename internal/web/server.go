@@ -9,6 +9,7 @@ package web
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +34,8 @@ import (
 type Reader interface {
 	Query(f store.Filter) ([]model.Exchange, error)
 	Sessions(f store.Filter) ([]store.Session, error)
+	Threads(session string) ([]store.Thread, []store.Ordered, error)
+	Page(f store.Filter) ([]model.Exchange, []store.Ordered, error)
 	Manifest(id string) (*model.Exchange, error)
 	// Blob takes the exchange's session id alongside the ref: archived bodies
 	// live in a per-session file, and the handler has already read the manifest.
@@ -49,6 +52,12 @@ func FromStore(st *store.Store) Reader { return storeReader{st} }
 func (s storeReader) Query(f store.Filter) ([]model.Exchange, error) { return s.st.Index.Query(f) }
 func (s storeReader) Sessions(f store.Filter) ([]store.Session, error) {
 	return s.st.Index.Sessions(f)
+}
+func (s storeReader) Threads(session string) ([]store.Thread, []store.Ordered, error) {
+	return s.st.Index.Threads(session)
+}
+func (s storeReader) Page(f store.Filter) ([]model.Exchange, []store.Ordered, error) {
+	return s.st.Index.Page(f)
 }
 func (s storeReader) Manifest(id string) (*model.Exchange, error) { return s.st.Manifests.Read(id) }
 func (s storeReader) Blob(session, ref string) ([]byte, error) {
@@ -73,6 +82,7 @@ func Handler(rd Reader, hub *Hub, uiPort int) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/sessions", s.handleSessions)
 	mux.HandleFunc("GET /api/exchanges", s.handleExchanges)
+	mux.HandleFunc("GET /api/threads", s.handleThreads)
 	mux.HandleFunc("GET /api/exchange/{id}", s.handleExchange)
 	mux.HandleFunc("GET /api/exchange/{id}/raw", s.handleRaw)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
@@ -100,6 +110,7 @@ func filterFrom(r *http.Request) store.Filter {
 	q := r.URL.Query()
 	f := store.Filter{
 		Session:      q.Get("session"),
+		Thread:       q.Get("thread"),
 		Source:       q.Get("source"),
 		Limit:        defaultLimit,
 		IncludeNoise: q.Get("noise") == "1",
@@ -151,19 +162,10 @@ func (s *server) mergeInflightSessions(rows []store.Session, f store.Filter) []s
 		at[rows[i].SessionID] = i
 	}
 	for _, e := range live {
-		if f.Session != "" && e.Req.SessionID != f.Session {
-			continue
-		}
-		if f.Source != "" && e.Source != f.Source {
-			continue
-		}
-		if !f.IncludeNoise && e.IsNoise {
+		if !f.Matches(&e) {
 			continue
 		}
 		ts := e.StartedAt.UnixMilli()
-		if f.Since > 0 && ts <= f.Since {
-			continue
-		}
 		i, ok := at[e.Req.SessionID]
 		if !ok {
 			// Sources is never nil: a Go nil slice marshals to JSON null and blanks
@@ -197,25 +199,189 @@ func (s *server) mergeInflightSessions(rows []store.Session, f store.Filter) []s
 	return rows
 }
 
+// handleThreads serves the agent summary of one session. It is an aggregate
+// over the whole session, not over the page of turns the list holds: a summary
+// built from a capped page undercounts a long session, and one built from a
+// thread-filtered page cannot see the other agents at all.
+func (s *server) handleThreads(w http.ResponseWriter, r *http.Request) {
+	sid := r.URL.Query().Get("session")
+	rows := []store.Thread{}
+	if sid != "" {
+		threads, order, err := s.rd.Threads(sid)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if threads != nil {
+			rows = threads
+		}
+		rows = s.live().overlayThreads(rows, sid, indexedIDs(order))
+	}
+	writeJSON(w, map[string]any{"threads": rows})
+}
+
+func indexedIDs(order []store.Ordered) map[string]bool {
+	out := make(map[string]bool, len(order))
+	for _, o := range order {
+		out[o.ID] = true
+	}
+	return out
+}
+
+// liveView is one reading of the hub, taken once per request so every overlay
+// in a response agrees on what is inflight and what has settled.
+type liveView struct{ inflight, settled []model.Exchange }
+
+func (s *server) live() liveView {
+	if s.hub == nil {
+		return liveView{}
+	}
+	i, st := s.hub.Snapshot()
+	return liveView{i, st}
+}
+
+// pending returns a session's exchanges the index does not hold yet: those
+// still streaming, and those that finished but whose row the index worker has
+// not written. The second kind is why this is not just the inflight set — the
+// dashboard hears of a commit first, and a rollup taken in between would miss
+// the turn with nothing prompting it to look again.
+func (v liveView) pending(sid string, indexed map[string]bool) []model.Exchange {
+	var out []model.Exchange
+	for _, set := range [][]model.Exchange{v.inflight, v.settled} {
+		for _, e := range set {
+			if e.Req.SessionID == sid && !indexed[e.ID] {
+				out = append(out, e)
+			}
+		}
+	}
+	return out
+}
+
+// overlayThreads adds what the index has not caught up with to the rollup: a
+// thread with a turn streaming is running, and a turn it has not stored yet is
+// counted, on the same grounds as mergeInflightSessions.
+func (v liveView) overlayThreads(rows []store.Thread, sid string, indexed map[string]bool) []store.Thread {
+	at := make(map[string]int, len(rows))
+	for i := range rows {
+		at[rows[i].Thread] = i
+	}
+	get := func(e model.Exchange) *store.Thread {
+		i, ok := at[e.Req.Thread]
+		if !ok {
+			ts := e.StartedAt.UnixMilli()
+			rows = append(rows, store.Thread{Thread: e.Req.Thread, FirstTS: ts, LastTS: ts})
+			i = len(rows) - 1
+			at[e.Req.Thread] = i
+		}
+		t := &rows[i]
+		t.ParentThread = cmp.Or(t.ParentThread, e.Req.ParentThread)
+		t.Agent = cmp.Or(t.Agent, e.Req.Agent)
+		return t
+	}
+	for _, e := range v.inflight {
+		if e.Req.SessionID == sid && e.Req.Thread != "" {
+			get(e).Running = true
+		}
+	}
+	for _, e := range v.pending(sid, indexed) {
+		if e.Req.Thread == "" {
+			continue
+		}
+		t := get(e)
+		ts := e.StartedAt.UnixMilli()
+		t.FirstTS = min(t.FirstTS, ts)
+		t.LastTS = max(t.LastTS, ts, e.EndedAt.UnixMilli())
+		if e.IsNoise {
+			continue
+		}
+		t.Turns++
+		t.Cost += e.Res.Cost
+		if ts >= t.LastTurnTS {
+			t.LastTurnTS, t.LastState = ts, string(e.State)
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].FirstTS < rows[j].FirstTS })
+	return rows
+}
+
 func (s *server) handleExchanges(w http.ResponseWriter, r *http.Request) {
 	f := filterFrom(r)
-	rows, err := s.rd.Query(f)
+	// Page reads the rows and, inside a session, the session's indexed turns
+	// from one snapshot, so a row indexed mid-request is in both or neither.
+	rows, order, err := s.rd.Page(f)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, map[string]any{"exchanges": s.mergeInflight(rows, f)})
+	lv := s.live()
+	rows = mergeInflight(rows, f, lv.inflight)
+	out := map[string]any{"exchanges": rows}
+	if f.Session != "" {
+		indexed := indexedIDs(order)
+		seq, n := lv.sessionSeq(f, order, indexed)
+		// A finished turn the index has not stored yet is listed too, or a
+		// reload in that moment would drop it from the list.
+		have := make(map[string]bool, len(rows))
+		for _, e := range rows {
+			have[e.ID] = true
+		}
+		for _, e := range lv.pending(f.Session, indexed) {
+			if !have[e.ID] && f.Matches(&e) {
+				rows = append(rows, e)
+				have[e.ID] = true
+			}
+		}
+		sort.SliceStable(rows, func(i, j int) bool { return rows[i].StartedAt.After(rows[j].StartedAt) })
+		// The rows sent, plus every turn the index has not caught up with, listed
+		// or not: seq_max counts those, so a client filtered to one thread must
+		// know their numbers or it would number one again when it streams in.
+		sent := make(map[string]int, len(rows))
+		for _, e := range rows {
+			if k, ok := seq[e.ID]; ok {
+				sent[e.ID] = k
+			}
+		}
+		for _, e := range lv.pending(f.Session, indexed) {
+			if k, ok := seq[e.ID]; ok {
+				sent[e.ID] = k
+			}
+		}
+		out["exchanges"], out["seq"], out["seq_max"] = rows, sent, n
+	}
+	writeJSON(w, out)
+}
+
+// sessionSeq numbers a session's turns in the order they started: the indexed
+// ones and the ones the index has not caught up with, ranked together, so a
+// turn still streaming takes its place among the others instead of being put
+// after every indexed one. Only the noise filter applies; the thread filter
+// and the page do not, which is what keeps a number the same however the list
+// is narrowed.
+func (v liveView) sessionSeq(f store.Filter, order []store.Ordered, indexed map[string]bool) (map[string]int, int) {
+	all := append([]store.Ordered(nil), order...)
+	for _, e := range v.pending(f.Session, indexed) {
+		if f.IncludeNoise || !e.IsNoise {
+			all = append(all, store.Ordered{ID: e.ID, TS: e.StartedAt.UnixMilli()})
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].TS != all[j].TS {
+			return all[i].TS < all[j].TS
+		}
+		return all[i].ID < all[j].ID
+	})
+	seq := make(map[string]int, len(all))
+	for i, o := range all {
+		seq[o.ID] = i + 1
+	}
+	return seq, len(all)
 }
 
 // mergeInflight overlays exchanges that are still streaming. They exist as
 // manifests but not yet in the index — the index upsert happens when the
 // response commits — so without this a turn would only be visible to clients
 // that were already listening on /api/events when it started.
-func (s *server) mergeInflight(rows []model.Exchange, f store.Filter) []model.Exchange {
-	if s.hub == nil {
-		return rows
-	}
-	live := s.hub.Inflight()
+func mergeInflight(rows []model.Exchange, f store.Filter, live []model.Exchange) []model.Exchange {
 	if len(live) == 0 {
 		return rows
 	}
@@ -227,16 +393,7 @@ func (s *server) mergeInflight(rows []model.Exchange, f store.Filter) []model.Ex
 		if _, dup := seen[e.ID]; dup {
 			continue
 		}
-		if f.Session != "" && e.Req.SessionID != f.Session {
-			continue
-		}
-		if f.Source != "" && e.Source != f.Source {
-			continue
-		}
-		if !f.IncludeNoise && e.IsNoise {
-			continue
-		}
-		if f.Since > 0 && e.StartedAt.UnixMilli() <= f.Since {
+		if !f.Matches(&e) {
 			continue
 		}
 		rows = append(rows, e)

@@ -423,6 +423,14 @@ path may need them to be right in order to fail safely.
   replace the heuristic.
 - **No SSE replay buffer.** A dashboard that reconnects misses whatever streamed
   while it was away; it refetches the list instead. Fine for a local tool.
+  Two cases it does not cover, both found in Codex's review of the agent
+  summary and left open: the hub drops frames for a client that falls behind
+  *without* closing its stream, so no reconnect fires and a turn whose final
+  frame was dropped stays inflight in the turn list until the next reload (the
+  agent summary polls while anything runs, so it recovers); and a live frame
+  that arrives while `/api/exchanges` is loading is overwritten by the older
+  response. Closing a lagging client's stream would turn both into the
+  reconnect case.
 - **`IsSubagent` is a heuristic** (`cwd == "" && sid == ""`) in
   `internal/wire/anthropic.go`. It has not been validated against a real subagent
   turn.

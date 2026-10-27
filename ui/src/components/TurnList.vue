@@ -1,4 +1,5 @@
 <script setup>
+import { computed } from 'vue'
 import { NEmpty, NSpin, NTag, NTooltip } from 'naive-ui'
 import CacheBar from './CacheBar.vue'
 import {
@@ -21,8 +22,31 @@ const props = defineProps({
   gaps: { type: Object, required: true },
   loading: { type: Boolean, default: false },
   ctxWindowOf: { type: Function, required: true },
+  // thread → { color, depth, label, parent, running, lastState, turns, cost,
+  // lastAt }; empty unless the selected session has more than one agent thread.
+  lanes: { type: Object, default: () => ({}) },
+  selectedThread: { type: String, default: '' },
 })
-const emit = defineEmits(['select'])
+const emit = defineEmits(['select', 'thread'])
+
+const laneOf = (ex) => props.lanes[ex.req?.thread || '']
+const laneList = computed(() => Object.values(props.lanes))
+// What an agent is doing, in the words a reader tracking it wants: working now,
+// or waiting with its last turn complete, or stopped on something that went
+// wrong.
+const agentStatus = (lane) => {
+  if (lane.running) return { text: 'running', tone: 'run' }
+  if (!lane.lastState || lane.lastState === 'complete') return { text: 'idle', tone: 'idle' }
+  const bad = ['upstream_error', 'persist_failed'].includes(lane.lastState)
+  return { text: stateLabel(lane.lastState), tone: bad ? 'bad' : 'warn' }
+}
+
+const laneTip = (lane) => {
+  const parent = props.lanes[lane.parent]
+  const from = parent ? ` · spawned by ${parent.label}` : ''
+  const act = lane.thread === props.selectedThread ? 'show every thread' : 'show only this thread'
+  return `${lane.label} · thread …${lane.thread.slice(-8)}${from} — click to ${act}`
+}
 
 // The ordinary model call for each client: Claude Code's messages call, and
 // Codex's Responses endpoint on either backend.
@@ -46,6 +70,10 @@ const title = (ex) => {
   return ''
 }
 
+// parse_ok is decided when the response is parsed, so an inflight turn has not
+// failed to parse — it has not been parsed yet.
+const unparsed = (ex) => !ex.parse_ok && ex.state !== 'inflight'
+
 // Both clients' way of saying the model finished and handed back to the user.
 const endedTurn = (ex) => ['end_turn', 'completed'].includes(ex.res?.stop_reason)
 </script>
@@ -57,6 +85,25 @@ const endedTurn = (ex) => ['end_turn', 'completed'].includes(ex.res?.stop_reason
       <span class="muted small">{{ exchanges.length }}</span>
       <NSpin v-if="loading" size="small" />
     </header>
+
+    <div v-if="laneList.length" class="agents">
+      <button
+        v-for="lane in laneList"
+        :key="lane.thread"
+        class="agent"
+        :class="{ on: lane.thread === selectedThread }"
+        :style="{ '--lane': lane.color, '--depth': lane.depth }"
+        :title="laneTip(lane)"
+        @click="emit('thread', lane.thread)"
+      >
+        <span class="dot" :class="{ pulse: lane.running }" />
+        <span class="name">{{ lane.label }}</span>
+        <span class="status" :class="agentStatus(lane).tone">{{ agentStatus(lane).text }}</span>
+        <span class="mono muted">{{ lane.turns }}t</span>
+        <span class="mono cost">{{ fmtCost(lane.cost) || '—' }}</span>
+        <span class="mono muted">{{ clockTime(lane.lastAt) }}</span>
+      </button>
+    </div>
 
     <div class="scroll">
       <NEmpty
@@ -70,9 +117,18 @@ const endedTurn = (ex) => ['end_turn', 'completed'].includes(ex.res?.stop_reason
         v-for="ex in exchanges"
         :key="ex.id"
         class="turn"
-        :class="[{ active: ex.id === selected }, `st-${ex.state}`]"
+        :class="[{ active: ex.id === selected, laned: laneOf(ex) }, `st-${ex.state}`]"
+        :style="
+          laneOf(ex) ? { '--lane': laneOf(ex).color, '--depth': laneOf(ex).depth } : undefined
+        "
         @click="emit('select', ex.id)"
       >
+        <span
+          v-if="laneOf(ex)"
+          class="lane"
+          :title="laneTip(laneOf(ex))"
+          @click.stop="emit('thread', ex.req.thread)"
+        />
         <div class="line1">
           <NTag size="tiny" :type="stateTone(ex.state)" :bordered="false" class="state">
             {{ stateLabel(ex.state) }}
@@ -117,10 +173,10 @@ const endedTurn = (ex) => ['end_turn', 'completed'].includes(ex.res?.stop_reason
           <span class="mono muted">{{ clockTime(startedMs(ex)) }}</span>
         </div>
 
-        <div v-if="ex.is_noise || !ex.parse_ok || ex.source" class="line5">
+        <div v-if="ex.is_noise || unparsed(ex) || ex.source" class="line5">
           <NTag v-if="ex.source" size="tiny" type="info" :bordered="false">{{ ex.source }}</NTag>
           <NTag v-if="ex.is_noise" size="tiny" :bordered="false">noise</NTag>
-          <NTooltip v-if="!ex.parse_ok" trigger="hover">
+          <NTooltip v-if="unparsed(ex)" trigger="hover">
             <template #trigger>
               <NTag size="tiny" type="warning" :bordered="false">unparsed</NTag>
             </template>
@@ -149,6 +205,93 @@ const endedTurn = (ex) => ['end_turn', 'completed'].includes(ex.res?.stop_reason
 .scroll {
   overflow-y: auto;
   flex: 1;
+}
+/* One row per agent thread: the overview a lane alone cannot give — who is
+   working right now and who has gone quiet. Capped so a guardian pool of a
+   dozen threads cannot push the turns off screen. */
+.agents {
+  max-height: 30%;
+  overflow-y: auto;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--gx-border);
+  flex: none;
+}
+.agent {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto 3em 4.5em auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 2px 10px 2px calc(10px + var(--depth) * 12px);
+  border: none;
+  border-left: 2px solid transparent;
+  background: none;
+  color: var(--gx-fg);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.agent:hover {
+  background: var(--gx-hover);
+}
+.agent.on {
+  background: var(--gx-active);
+  border-left-color: var(--lane);
+}
+.agent .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent .status {
+  font-size: 10px;
+}
+.status.run {
+  color: var(--gx-accent);
+}
+.status.idle {
+  color: var(--gx-dim);
+}
+.status.warn {
+  color: var(--gx-warn);
+}
+.status.bad {
+  color: var(--gx-error);
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--lane);
+}
+.dot.pulse {
+  animation: blink 1.2s ease-in-out infinite;
+}
+@keyframes blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+/* A Codex session's turns stay in time order; the lane says which agent made
+   each one, and the indent how deep in the spawn tree that agent sits. */
+.turn.laned {
+  position: relative;
+  padding-left: calc(16px + var(--depth) * 10px);
+}
+.lane {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(4px + var(--depth) * 10px);
+  width: 5px;
+  border-radius: 2px;
+  background: var(--lane);
+  opacity: 0.75;
+  cursor: pointer;
+}
+.lane:hover {
+  opacity: 1;
 }
 .turn {
   display: block;

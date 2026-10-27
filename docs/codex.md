@@ -355,7 +355,11 @@ come from one code path.
 Session id: `client_metadata.session_id`, else the `session-id` header; a turn
 always takes its connection's. Thread, parent thread, agent name and request
 kind are kept in `req` and projected into the index so the dashboard can label
-a sub-agent's turns without opening them. cwd is the last `<cwd>` inside an
+a sub-agent's turns without opening them. The agent is Codex's agent path
+(`/root`, `/root/<name>`), except that a reviewer, compaction, guardian or
+memory thread has no path of its own and reports the root's; for those the
+`x-openai-subagent` label (`review`, `compact`, …) is kept instead, or every
+such thread would read as the root agent. cwd is the last `<cwd>` inside an
 `<environment_context>` message in the full input (later turns send it only as
 a diff, which is why it has to come from the reconstructed input).
 
@@ -403,7 +407,7 @@ and is the obvious later source.
 ## Index
 
 `schemaVer` goes to 3 (rebuild from manifests, as every bump does) for new
-columns `transport`, `conn`, `thread`, `agent`, `kind`. `CaptureVersion` goes to
+columns `transport`, `conn`, `thread`, `parent_thread`, `agent`, `kind`. `CaptureVersion` goes to
 2: a v2 manifest can describe a turn with no body refs of its own, which a v1
 reader would misread as "not recorded".
 
@@ -418,6 +422,78 @@ it serves the turn's records from the log, and the connection's whole log is
 one more raw view. A settled turn is replayed only up to its manifest's `last`,
 and only if the turn record at `first` names it; an inflight turn replays to the
 end of the live log, since its events are what the reader is watching for.
+
+**Several agents, one session.** Sub-agents, reviewers and guardian threads
+share the root session id, so their turns land in one list. The list stays in
+time order — tree-grouping was considered and rejected, because it buries the
+turn that is running now inside a subtree, and watching that is what the
+dashboard is for. Instead, once a session has more than one thread, each turn
+carries a coloured lane for its thread, indented by its depth in the spawn tree
+(`parent_thread`). Above the list, one row per thread summarises the agent —
+running (any turn inflight) or idle, or how its latest turn failed; its turn
+count, cost and last activity — which is the overview the lanes alone do not
+give. The summary comes from `/api/threads?session=`, a `GROUP BY thread` over
+the index plus what the index does not hold yet. It is not folded from the turn
+list in the browser: that list is capped at 500 rows and, under a thread
+filter, holds one agent, so a summary built from it undercounts a long session
+and lets a hidden agent whose final frame was missed pulse "running" forever.
+
+"What the index does not hold yet" is two things. A turn streaming now is in
+the hub's inflight set. A turn that has just finished is in neither place: the
+recorder announces a commit before its index row is written, on another
+goroutine behind a queue, so a summary taken in that moment would miss it with
+nothing to prompt another look. The hub therefore keeps finished turns for two
+minutes, and the server counts any of them the index does not have — checked
+against the session's indexed ids, read in the same transaction as the rollup,
+so a row landing mid-request is counted once. The hub is read once per request,
+under one lock, so a turn finishing mid-request is inflight or settled, never
+both; and a listing reads its page and the session's ids in one transaction
+too. A turn whose index write fails drops out after the two minutes, like any
+unindexed turn, until the next start reconciles the index from the manifests. The browser refetches the summary
+(coalesced) on every live frame of the session and on reconnect, and every 10 s
+while any agent shows running, including after a failed fetch: the hub drops
+frames for a client that falls behind without closing its stream, so a lost
+final frame has no reconnect to recover it.
+
+A row or a lane narrows the list to that thread (`/api/exchanges?thread=`,
+which the overlays honour too). Turn numbers are session-wide: inside a session
+`/api/exchanges` returns each row's number in the whole session (`seq`), ranking
+the indexed turns and the not-yet-indexed ones together by start time, so a turn
+still streaming takes its place among the others. Neither the 500-row cap nor a
+thread filter renumbers a turn. Only the noise filter changes the numbering, as
+it changes what is listed. Turns arriving live are numbered provisionally after
+the server's count, in the order they started rather than the order their
+frames arrived, hidden noise excepted; the next load replaces them. A `spawn_agent`, `send_message`,
+`followup_task` or `close_agent` call links to the agent it names, landing on
+its first turn; a relative name resolves against the calling agent's path, as
+Codex resolves it, and a suffix match is used only when it is unambiguous. The
+idle gap shown on a turn is measured within its thread, since each agent is its
+own conversation with its own cache. Claude Code turns carry no thread and look
+as before.
+
+**What an agent was told is not recorded, because it is not sent.** Codex marks
+the `message` parameter of those tools encrypted in their schema, so the API
+returns the argument as a Fernet token (`gAAAAA…`: version byte 0x80,
+timestamp, IV, AES-CBC blocks, HMAC) and the child receives it as an
+`encrypted_content` part of an `agent_message` item. Neither Codex nor goxray
+ever holds the plaintext. The views say so rather than showing the token, and
+keep what is in the clear: the task name, the message header, and a sub-agent's
+`FINAL_ANSWER`, which comes back unencrypted.
+
+Which parameters are encrypted is read from the request's own tool schema
+(`"encrypted": true`), keyed by namespace and name as a call addresses its
+tool. Codex 0.164 sends its agent tools as an `additional_tools` input item, in
+a `collaboration` namespace, and calls them with `namespace: "collaboration"`;
+an MCP server's tool or a client-defined one may share the name, and a tool may
+take a Fernet token as an ordinary argument. Neither a list of names nor the
+token's shape can tell those apart; the schema does. A value is still redacted
+only if it is a Fernet token, so a client sending one in the clear is shown in
+the clear, and a turn whose request is unreadable shows the token as sent.
+
+**A turn's duration ends at its terminal event**, not at the end of its range.
+The range runs to the next `response.create` or to the connection's close, and a
+socket left open while the user reads would otherwise count as time the model
+spent. A turn with no terminal event ends where its range does.
 
 ## Not covered
 

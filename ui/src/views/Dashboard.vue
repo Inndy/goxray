@@ -9,8 +9,10 @@ import {
   ctxWindowOf,
   gaps,
   init,
+  lanes,
   selectExchange,
   selectSession,
+  selectThread,
   sessionOfExchange,
   setFollow,
   setShowNoise,
@@ -113,7 +115,10 @@ const onTurn = (id) => pushSelection(sessionOfExchange(id), id)
                 :gaps="gaps"
                 :loading="store.loadingList"
                 :ctx-window-of="ctxWindowOf"
+                :lanes="lanes"
+                :selected-thread="store.selectedThread"
                 @select="onTurn"
+                @thread="selectThread"
               />
             </template>
             <template #2>

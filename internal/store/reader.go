@@ -54,6 +54,22 @@ func (r *Reader) List(f Filter) ([]model.Exchange, error) {
 // *Reader and a live *Index are interchangeable for read-only queries.
 func (r *Reader) Query(f Filter) ([]model.Exchange, error) { return r.List(f) }
 
+// Threads returns one session's per-thread rollups. Empty when no index exists yet.
+func (r *Reader) Threads(session string) ([]Thread, []Ordered, error) {
+	if r.db == nil {
+		return nil, nil, nil
+	}
+	return threadsSnapshot(r.db, session)
+}
+
+// Page is a listing plus its session's order; see Index.Page.
+func (r *Reader) Page(f Filter) ([]model.Exchange, []Ordered, error) {
+	if r.db == nil {
+		return nil, nil, nil
+	}
+	return pageSnapshot(r.db, f)
+}
+
 // Sessions returns per-session rollups. Empty when no index exists yet.
 func (r *Reader) Sessions(f Filter) ([]Session, error) {
 	if r.db == nil {

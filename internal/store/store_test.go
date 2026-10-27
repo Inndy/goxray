@@ -3,9 +3,11 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"go.inndy.tw/goxray/internal/model"
 )
@@ -371,6 +373,123 @@ func TestRebuildFromManifests(t *testing.T) {
 	}
 	_ = idx.Close()
 	_ = blobsDir
+}
+
+// A Codex session holds several agents' threads; the dashboard narrows to one,
+// and the parent survives the round trip so it can draw who spawned whom.
+func TestIndexFiltersByThread(t *testing.T) {
+	d := t.TempDir()
+	idx, _, _, err := OpenIndex(filepath.Join(d, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	for i, thr := range []string{"t-root", "t-child", "t-root"} {
+		ex := model.Exchange{ID: fmt.Sprintf("00000000-0000-7000-8000-00000000000%d", i),
+			Provider: model.ProviderOpenAI, State: model.StateComplete,
+			Req: model.ReqMeta{SessionID: "s", Thread: thr, Agent: "/root"}}
+		if thr == "t-child" {
+			ex.Req.ParentThread, ex.Req.Agent = "t-root", "/root/task"
+		}
+		if err := idx.Upsert(ex); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := idx.Query(Filter{Session: "s", Thread: "t-child"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Req.ParentThread != "t-root" || rows[0].Req.Agent != "/root/task" {
+		t.Fatalf("thread filter = %+v", rows)
+	}
+	if rows, _ := idx.Query(Filter{Session: "s"}); len(rows) != 3 {
+		t.Errorf("no thread filter returned %d rows, want 3", len(rows))
+	}
+}
+
+// The agent summary is a rollup of the whole session: noise is listed but not
+// counted, the latest real turn decides the state, and a thread's name and
+// parent survive turns that leave them empty.
+func TestIndexRollsThreadsUp(t *testing.T) {
+	d := t.TempDir()
+	idx, _, _, err := OpenIndex(filepath.Join(d, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	base := time.UnixMilli(1_000_000).UTC()
+	rows := []model.Exchange{
+		{Req: model.ReqMeta{Thread: "t-root", Agent: "/root"}, State: model.StateComplete},
+		{Req: model.ReqMeta{Thread: "t-root"}, State: model.StateComplete, IsNoise: true},
+		{Req: model.ReqMeta{Thread: "t-child", ParentThread: "t-root", Agent: "/root/task"}, State: model.StateComplete},
+		{Req: model.ReqMeta{Thread: "t-child", ParentThread: "t-root", Agent: "/root/task"}, State: model.StateUpstreamError},
+		{Req: model.ReqMeta{Thread: "t-root", Agent: "/root"}, State: model.StateComplete},
+		{Req: model.ReqMeta{Thread: "other"}, State: model.StateComplete}, // another session
+	}
+	for i, ex := range rows {
+		ex.ID = fmt.Sprintf("00000000-0000-7000-8000-00000000001%d", i)
+		ex.Provider = model.ProviderOpenAI
+		ex.Req.SessionID = "s"
+		if ex.Req.Thread == "other" {
+			ex.Req.SessionID = "s2"
+		}
+		ex.StartedAt = base.Add(time.Duration(i) * time.Second)
+		ex.EndedAt = ex.StartedAt.Add(500 * time.Millisecond)
+		ex.Res.Cost = 1
+		if err := idx.Upsert(ex); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, order, err := idx.Threads("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("threads = %+v", got)
+	}
+	// The ids come from the same snapshot, noise included: they are what the
+	// rollup covers.
+	if len(order) != 5 {
+		t.Errorf("snapshot ids = %d, want the session's 5", len(order))
+	}
+	root, child := got[0], got[1]
+	if root.Thread != "t-root" || root.Agent != "/root" || root.Turns != 2 || root.LastState != "complete" ||
+		root.LastTS != base.Add(4500*time.Millisecond).UnixMilli() {
+		t.Errorf("root = %+v", root)
+	}
+	if child.ParentThread != "t-root" || child.Turns != 2 || child.LastState != "upstream_error" {
+		t.Errorf("child = %+v", child)
+	}
+}
+
+// A session's turns are ordered over the whole session, whatever page or
+// thread a listing returns, and noise is listed only when it is shown.
+func TestIndexSessionOrderCoversTheSession(t *testing.T) {
+	d := t.TempDir()
+	idx, _, _, err := OpenIndex(filepath.Join(d, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	base := time.UnixMilli(1_000_000).UTC()
+	id := func(i int) string { return fmt.Sprintf("00000000-0000-7000-8000-00000000002%d", i) }
+	for i := range 5 {
+		ex := model.Exchange{ID: id(i), Provider: model.ProviderOpenAI, State: model.StateComplete,
+			IsNoise: i == 1, StartedAt: base.Add(time.Duration(i) * time.Second), Req: model.ReqMeta{SessionID: "s"}}
+		if err := idx.Upsert(ex); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := idx.SessionOrder("s", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 || got[0].ID != id(0) || got[1].ID != id(2) || got[3].ID != id(4) {
+		t.Errorf("order without noise = %v", got)
+	}
+	if got, _ := idx.SessionOrder("s", true); len(got) != 5 || got[1].ID != id(1) {
+		t.Errorf("order with noise = %v", got)
+	}
 }
 
 func TestReconcileStragglers(t *testing.T) {
