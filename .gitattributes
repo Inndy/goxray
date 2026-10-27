@@ -1,0 +1,4 @@
+# Keep LF in the working tree on every platform. A global core.autocrlf=true
+# otherwise checks Go and Vue sources out as CRLF, which gofmt reports as
+# unformatted and which turns any rewrite of a file into a whole-file diff.
+* text=auto eol=lf
