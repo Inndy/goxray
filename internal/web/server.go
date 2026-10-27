@@ -8,6 +8,7 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -289,6 +290,11 @@ func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
 	// let the request body correct it below: a detail view that disagreed with the
 	// row it was opened from would read as one of the two being wrong.
 	d := detail{Exchange: ex, CtxWindow: ex.Req.CtxWindow}
+	if ex.Provider == model.ProviderOpenAI {
+		s.openaiDetail(&d)
+		writeJSON(w, d)
+		return
+	}
 	if d.CtxWindow == 0 {
 		d.CtxWindow = wire.CtxWindow(ex.Req.Model, nil)
 	}
@@ -336,6 +342,113 @@ func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, d)
 }
 
+// openaiDetail fills a detail for a Responses API turn. The request is
+// translated into the Messages shape the views are built on (view.FromResponses);
+// for a WebSocket turn it is first rebuilt from the connection's log, because
+// the frame itself may carry only what was new since the previous response.
+//
+// No context window is assumed: a Responses request does not say which one the
+// client is working against, and a guessed denominator is worse than none.
+func (s *server) openaiDetail(d *detail) {
+	ex := d.Exchange
+	var req []byte
+	var events [][]byte
+	var resBytes int
+	resKnown := false
+
+	switch {
+	case ex.WS != nil:
+		log, err := s.rd.Blob(ex.Req.SessionID, ex.WS.Log)
+		if err != nil {
+			d.Warnings = append(d.Warnings, "connection log unreadable: "+err.Error())
+			break
+		}
+		// A record number is only a pointer; the turn record says whose turn
+		// starts there, and a manifest pointing at another's must not show it.
+		t := wire.ReplayTurn(log, ex.WS.First, wsLast(ex))
+		if t == nil || t.ID != ex.ID {
+			d.Warnings = append(d.Warnings, "this turn's records are not in its connection log; run goxray fsck")
+			break
+		}
+		if t.Incomplete {
+			d.Warnings = append(d.Warnings, "this request continued a response the connection log does not hold; earlier context is missing")
+		}
+		req = t.Request
+		if req == nil {
+			req = t.Create
+		}
+		events, resKnown = t.Events, true
+		for _, e := range events {
+			resBytes += len(e) + 1
+		}
+	case ex.ReqRef == "":
+		d.Warnings = append(d.Warnings, "request body was not recorded")
+	default:
+		body, err := s.rd.Blob(ex.Req.SessionID, ex.ReqRef)
+		if err != nil {
+			d.Warnings = append(d.Warnings, "request body unreadable: "+err.Error())
+			break
+		}
+		req = wire.DecodeContent(ex.ReqHeaders["content-encoding"], body)
+	}
+
+	if req != nil {
+		if conv := view.FromResponses(req); conv == nil {
+			d.Warnings = append(d.Warnings, "request body is not JSON; use the raw view")
+		} else {
+			var r struct {
+				System   json.RawMessage `json:"system"`
+				Messages json.RawMessage `json:"messages"`
+			}
+			_ = json.Unmarshal(conv, &r)
+			d.System = view.SystemBlocks(r.System)
+			d.Messages = r.Messages
+			d.Tools = view.Tools(conv)
+			d.Tokens = view.Tokens(conv)
+			d.Options = view.Options(conv)
+		}
+	}
+
+	if ex.Res.Cost == 0 && ex.Req.Model != "" && !pricing.Known(ex.Req.Model) && !pricing.Known(ex.Res.Model) {
+		d.Warnings = append(d.Warnings, "no price on file for "+ex.Req.Model+"; cost shown as zero")
+	}
+
+	if !resKnown && ex.WS == nil && ex.ResRef != "" {
+		body, err := s.rd.Blob(ex.Req.SessionID, ex.ResRef)
+		if err != nil {
+			d.Warnings = append(d.Warnings, "response body unreadable: "+err.Error())
+		} else {
+			resBytes, resKnown = len(body), true
+			ct := ex.ResHeaders["content-type"]
+			switch {
+			case strings.Contains(ct, "text/event-stream"):
+				for _, e := range wire.ParseSSEEvents(body) {
+					events = append(events, e.Data)
+				}
+			case json.Valid(body):
+				// A whole response object: its output is the reply.
+				events = [][]byte{[]byte(`{"type":"response.completed","response":` + string(body) + `}`)}
+			}
+		}
+	}
+	if ex.State == model.StateInflight {
+		d.Warnings = append(d.Warnings, "response still streaming")
+	}
+	if !resKnown {
+		if ex.State != model.StateInflight {
+			d.Warnings = append(d.Warnings, "response body was not recorded")
+		}
+		return
+	}
+	rv := &responseView{ContentType: "application/jsonl", Bytes: resBytes}
+	for _, e := range events {
+		rv.Events = append(rv.Events, wire.SSEEvent{Type: wire.EventType(e), Data: e})
+	}
+	items, terminal := view.ResponsesOutput(events)
+	rv.Message = view.AssembleResponses(items, view.FindEncryptedParams(req), ex.Res.Model, ex.Res.ResponseID, ex.Res.StopReason, terminal == "")
+	d.Response = rv
+}
+
 func buildResponseView(ex *model.Exchange, body []byte) *responseView {
 	ct := ex.ResHeaders["content-type"]
 	rv := &responseView{ContentType: ct, Bytes: len(body)}
@@ -371,6 +484,10 @@ func (s *server) handleRaw(w http.ResponseWriter, r *http.Request) {
 	if side == "" {
 		side = "req"
 	}
+	if ex.WS != nil {
+		s.rawWS(w, ex, side)
+		return
+	}
 	var ref, ct string
 	switch side {
 	case "req":
@@ -390,6 +507,16 @@ func (s *server) handleRaw(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if side == "req" {
+		// Stored as received; a browser cannot show a zstd body, so this view
+		// shows it decoded and says so. `goxray raw` gives the stored bytes.
+		if enc := ex.ReqHeaders["content-encoding"]; enc != "" {
+			if dec := wire.DecodeContent(enc, body); !bytes.Equal(dec, body) {
+				body = dec
+				w.Header().Set("x-goxray-decoded", enc)
+			}
+		}
+	}
 	base, _, _ := strings.Cut(ct, ";")
 	if !rawContentTypes[strings.TrimSpace(base)] {
 		ct = "text/plain; charset=utf-8"
@@ -397,6 +524,50 @@ func (s *server) handleRaw(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("content-type", ct)
 	w.Header().Set("content-length", strconv.Itoa(len(body)))
 	w.Header().Set("content-disposition", fmt.Sprintf("inline; filename=%q", ex.ID+"_"+side+".json"))
+	_, _ = w.Write(body)
+}
+
+// wsLast is where a turn's replay stops: its recorded range once settled. An
+// inflight turn's range is only what it had when its request was written, and
+// its events are what a reader is watching for, so it replays to the log's end.
+func wsLast(ex *model.Exchange) int64 {
+	if ex.State == model.StateInflight {
+		return 0
+	}
+	return ex.WS.Last
+}
+
+// rawWS serves a WebSocket turn's bytes out of its connection log: the
+// response.create as sent (req), the events that answered it one per line
+// (res), or the connection's whole log (log).
+func (s *server) rawWS(w http.ResponseWriter, ex *model.Exchange, side string) {
+	log, err := s.rd.Blob(ex.Req.SessionID, ex.WS.Log)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var body []byte
+	switch side {
+	case "log":
+		body = log
+	case "req", "res":
+		t := wire.ReplayTurn(log, ex.WS.First, wsLast(ex))
+		if t == nil || t.ID != ex.ID {
+			writeErr(w, http.StatusNotFound, "turn not found in its connection log")
+			return
+		}
+		if side == "req" {
+			body = t.Create
+		} else {
+			body = t.EventsJSONL()
+		}
+	default:
+		writeErr(w, http.StatusBadRequest, "side must be req, res or log")
+		return
+	}
+	w.Header().Set("content-type", "text/plain; charset=utf-8")
+	w.Header().Set("content-length", strconv.Itoa(len(body)))
+	w.Header().Set("content-disposition", fmt.Sprintf("inline; filename=%q", ex.ID+"_"+side+".jsonl"))
 	_, _ = w.Write(body)
 }
 

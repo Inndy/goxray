@@ -98,13 +98,20 @@ const events = computed(() => res.value?.events || [])
           tag="a"
           :href="rawURL(ex.id, 'res')"
           target="_blank"
-          :disabled="!ex.res_ref"
+          :disabled="!ex.res_ref && !ex.ws"
         >
           response
         </NButton>
+        <NButton v-if="ex.ws" size="tiny" tag="a" :href="rawURL(ex.id, 'log')" target="_blank">
+          connection log
+        </NButton>
         <span class="mono dim" v-if="res">{{ res.bytes }} bytes · {{ res.content_type }}</span>
       </div>
-      <p class="note">Verbatim recorded bytes, exactly as they crossed the wire.</p>
+      <p class="note" v-if="ex.ws">
+        A WebSocket turn: request and response are this turn's frames from its connection's log,
+        verbatim, one per line. The log is every frame of the connection, in order.
+      </p>
+      <p class="note" v-else>Verbatim recorded bytes, exactly as they crossed the wire.</p>
     </section>
 
     <NCollapse arrow-placement="right">

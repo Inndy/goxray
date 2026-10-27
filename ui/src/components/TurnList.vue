@@ -24,17 +24,30 @@ const props = defineProps({
 })
 const emit = defineEmits(['select'])
 
-const STD_ROUTE = /^\/v1\/messages(\?|$)/
+// The ordinary model call for each client: Claude Code's messages call, and
+// Codex's Responses endpoint on either backend.
+const STD_ROUTE = /^(\/v1\/messages|\/backend-api\/codex\/responses|\/v1\/responses)(\?|$)/
 
 // Only Claude Code's title-generation turns carry a real title. Rather than
 // padding every other row with the same "/v1/messages?beta=true", the route is
 // shown only when it is not the ordinary messages call — where it genuinely
 // distinguishes the turn (count_tokens, /api/hello, a quota probe).
+//
+// Codex names its own requests instead: which agent made the call (a spawned
+// sub-agent, a reviewer) and what kind it was (compaction, prewarm). Those are
+// shown in the route's place; a plain turn by the root agent needs neither.
 const title = (ex) => {
   if (ex.res?.title) return ex.res.title
+  const parts = []
+  if (ex.req?.kind && ex.req.kind !== 'turn') parts.push(ex.req.kind)
+  if (ex.req?.agent && ex.req.agent !== '/root') parts.push(ex.req.agent)
+  if (parts.length) return parts.join(' · ')
   if (ex.url && !STD_ROUTE.test(ex.url)) return ex.url
   return ''
 }
+
+// Both clients' way of saying the model finished and handed back to the user.
+const endedTurn = (ex) => ['end_turn', 'completed'].includes(ex.res?.stop_reason)
 </script>
 
 <template>
@@ -70,12 +83,14 @@ const title = (ex) => {
             }}
           </span>
           <span class="model">{{ ex.req?.model || '—' }}</span>
-          <NTooltip v-if="ex.res?.stop_reason === 'end_turn'" trigger="hover">
+          <NTooltip v-if="endedTurn(ex)" trigger="hover">
             <template #trigger><span class="endturn">↵</span></template>
             Ended the turn — was waiting on the user
           </NTooltip>
           <span class="spacer" />
-          <span v-if="ex.status && ex.status !== 200" class="status">{{ ex.status }}</span>
+          <span v-if="ex.status && ex.status !== 200 && ex.status !== 101" class="status">{{
+            ex.status
+          }}</span>
           <span v-if="fmtCost(ex.res?.cost)" class="cost">{{ fmtCost(ex.res.cost) }}</span>
         </div>
 
