@@ -20,7 +20,7 @@ import (
 
 // schemaVer is bumped whenever the SQLite projection shape changes. On a bump,
 // the index is dropped and rebuilt from manifests — no ALTER/backfill.
-const schemaVer = 2
+const schemaVer = 3
 
 const createSQL = `
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS entries(
   input_tokens INT, output_tokens INT, cache_read INT, cache_create INT,
   cost REAL, status INT, stop_reason TEXT, cwd TEXT, is_subagent INT,
   title TEXT, elapsed_ms INT, ratelimit TEXT,
-  req_ref TEXT, res_ref TEXT, parse_ok INT
+  req_ref TEXT, res_ref TEXT, parse_ok INT,
+  transport TEXT, kind TEXT, conn TEXT, thread TEXT, agent TEXT, req_kind TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_session ON entries(session, ts);
 CREATE INDEX IF NOT EXISTS idx_source ON entries(source, ts);
@@ -42,8 +43,9 @@ const upsertSQL = `
 INSERT OR REPLACE INTO entries(
   id,ts,capture_ver,state,provider,source,session,is_noise,method,url,request_id,
   model,msg_count,tool_count,ctx_window,input_tokens,output_tokens,cache_read,cache_create,
-  cost,status,stop_reason,cwd,is_subagent,title,elapsed_ms,ratelimit,req_ref,res_ref,parse_ok)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  cost,status,stop_reason,cwd,is_subagent,title,elapsed_ms,ratelimit,req_ref,res_ref,parse_ok,
+  transport,kind,conn,thread,agent,req_kind)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 // Filter narrows a Query. Since is a UnixMilli lower bound (exclusive), used by
 // the dashboard to fetch only what appeared after its last poll.
@@ -140,8 +142,13 @@ func OpenIndex(path string) (idx *Index, needFullRebuild, wasClean bool, err err
 	prevVer := getMeta(db, "schema_ver")
 	wasClean = getMeta(db, "clean_shutdown") == "1"
 	if prevVer != fmt.Sprint(schemaVer) {
-		// Schema drift (or fresh DB): wipe and force a full rebuild.
-		if _, err := db.Exec(`DELETE FROM entries`); err != nil {
+		// Schema drift (or fresh DB): wipe and force a full rebuild. The table is
+		// dropped, not emptied: CREATE IF NOT EXISTS would otherwise keep the old
+		// column set, and every upsert naming a new column would fail.
+		if _, err := db.Exec(`DROP TABLE IF EXISTS entries`); err == nil {
+			_, err = db.Exec(createSQL)
+		}
+		if err != nil {
 			db.Close()
 			return nil, false, false, err
 		}
@@ -202,8 +209,16 @@ func doUpsert(stmt *sql.Stmt, ex *model.Exchange) error {
 		ex.Res.Usage.CacheReadTokens, ex.Res.Usage.CacheCreateTokens,
 		ex.Res.Cost, ex.Status, ex.Res.StopReason, ex.Req.Cwd, b2i(ex.Req.IsSubagent),
 		ex.Res.Title, ex.ElapsedMS(), rateLimitJSON(ex), ex.ReqRef, ex.ResRef, b2i(ex.ParseOK),
+		string(ex.Transport), ex.Kind, wsConn(ex), ex.Req.Thread, ex.Req.Agent, ex.Req.Kind,
 	)
 	return err
+}
+
+func wsConn(ex *model.Exchange) string {
+	if ex.WS != nil {
+		return ex.WS.Conn
+	}
+	return ""
 }
 
 // Query returns matching exchanges, newest first.
@@ -221,7 +236,8 @@ func (i *Index) Sessions(f Filter) ([]Session, error) {
 // dropped cache_read/cache_create, which the context bar depends on).
 const entryCols = `id,ts,capture_ver,state,provider,source,session,is_noise,method,url,request_id,
   model,msg_count,tool_count,ctx_window,input_tokens,output_tokens,cache_read,cache_create,
-  cost,status,stop_reason,cwd,is_subagent,title,elapsed_ms,ratelimit,req_ref,res_ref,parse_ok`
+  cost,status,stop_reason,cwd,is_subagent,title,elapsed_ms,ratelimit,req_ref,res_ref,parse_ok,
+  transport,kind,conn,thread,agent,req_kind`
 
 func queryEntries(db *sql.DB, f Filter) ([]model.Exchange, error) {
 	where, args := f.where()
@@ -248,7 +264,7 @@ func scanEntry(rows *sql.Rows) (model.Exchange, error) {
 	var e model.Exchange
 	var ts, elapsed int64
 	var isNoise, isSubagent, parseOK int
-	var reqID, ratelimit string
+	var reqID, ratelimit, conn string
 	if err := rows.Scan(
 		&e.ID, &ts, &e.CaptureVer, &e.State, &e.Provider, &e.Source, &e.Req.SessionID, &isNoise,
 		&e.Method, &e.URL, &reqID,
@@ -257,12 +273,18 @@ func scanEntry(rows *sql.Rows) (model.Exchange, error) {
 		&e.Res.Usage.CacheReadTokens, &e.Res.Usage.CacheCreateTokens,
 		&e.Res.Cost, &e.Status, &e.Res.StopReason, &e.Req.Cwd, &isSubagent,
 		&e.Res.Title, &elapsed, &ratelimit, &e.ReqRef, &e.ResRef, &parseOK,
+		&e.Transport, &e.Kind, &conn, &e.Req.Thread, &e.Req.Agent, &e.Req.Kind,
 	); err != nil {
 		return e, err
 	}
 	e.IsNoise = isNoise != 0
 	e.Req.IsSubagent = isSubagent != 0
 	e.ParseOK = parseOK != 0
+	if conn != "" {
+		// Only the connection is projected; a turn's log and range are read
+		// from its manifest, which is where a detail view goes anyway.
+		e.WS = &model.WSRef{Conn: conn}
+	}
 	e.StartedAt = time.UnixMilli(ts).UTC()
 	if elapsed > 0 {
 		e.EndedAt = e.StartedAt.Add(time.Duration(elapsed) * time.Millisecond)

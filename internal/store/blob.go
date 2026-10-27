@@ -84,7 +84,15 @@ func (s *localBlobs) Get(session, ref string) ([]byte, error) {
 	if err == nil {
 		return s.dec.DecodeAll(comp, nil)
 	}
-	if !errors.Is(err, fs.ErrNotExist) || session == "" || s.archives == "" {
+	if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	// A connection log still being written. Checked after the .zst because a
+	// sealed log keeps its .gxl until every manifest is settled.
+	if raw, lerr := readLive(livePath(s.dir, ref)); lerr == nil || !errors.Is(lerr, fs.ErrNotExist) {
+		return raw, lerr
+	}
+	if session == "" || s.archives == "" {
 		return nil, err
 	}
 

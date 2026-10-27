@@ -51,6 +51,12 @@ func Open(blobsDir, manifestsDir, archivesDir, indexPath string, provider model.
 		}
 	}
 
+	// Connections a previous process left open are finished before anything
+	// else reads the store: until then their turns read as inflight forever.
+	for _, p := range RecoverStreams(blobsDir, manifests, idx) {
+		log.Printf("goxray: connection log %s", p)
+	}
+
 	rec := NewRecorder(blobs, manifests, idx, provider, workers)
 	return &Store{Blobs: blobs, Manifests: manifests, Index: idx, Recorder: rec}, nil
 }

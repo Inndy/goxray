@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"go.inndy.tw/goxray/internal/model"
+	"go.inndy.tw/goxray/internal/wire"
 )
 
 // FsckOptions configures an integrity check.
@@ -174,6 +175,7 @@ func Fsck(o FsckOptions) (FsckStats, error) {
 	// Pass 2: every manifest's bodies must be reachable. A ref already verified
 	// in pass 1 is known good; anything else has to be read to prove it.
 	manifests := newLocalManifests(o.ManifestsDir, o.ArchivesDir)
+	wsc := newWSChecker(blobs, manifests)
 	err = manifests.EachID(func(id string) error {
 		ex, err := manifests.Read(id)
 		if err != nil {
@@ -189,13 +191,22 @@ func Fsck(o FsckOptions) (FsckStats, error) {
 			side string
 			ref  string
 		}{{"request", ex.ReqRef}, {"response", ex.ResRef}}
+		if ex.WS != nil {
+			check = append(check, struct {
+				side string
+				ref  string
+			}{"log", ex.WS.Log})
+			if p := wsc.check(ex); p != "" {
+				st.Problems = append(st.Problems, fmt.Sprintf("%s: %s", id, p))
+			}
+		}
 		home := archiveFile(o.ArchivesDir, ex.Req.SessionID)
 		for _, c := range check {
 			if c.ref == "" || archived[archivedRef{path: home, ref: c.ref}] {
 				continue
 			}
 			if _, err := blobs.Get(ex.Req.SessionID, c.ref); err != nil {
-				if errors.Is(err, fs.ErrNotExist) && ex.State == model.StateInflight {
+				if errors.Is(err, fs.ErrNotExist) && ex.State == model.StateInflight && c.side != "log" {
 					continue
 				}
 				st.Missing = append(st.Missing, FsckMissing{
@@ -218,4 +229,100 @@ func relPath(dir, path string) string {
 		return r
 	}
 	return path
+}
+
+// wsChecker verifies that a WebSocket turn's record is coherent: that its
+// connection exists and owns the log, and that the range it names is really its
+// own. Archive content hashes prove the log's bytes are the bytes that went in;
+// they cannot prove a manifest points at the right ones, and a wrong range
+// would otherwise render another turn's conversation without complaint.
+type wsChecker struct {
+	blobs     *localBlobs
+	manifests *localManifests
+	// turns caches each log's turn spans by record number of their create, so
+	// a connection with many turns is decoded once. Spans, not turns: a turn
+	// holds every event it saw.
+	turns map[string]map[int64]turnSpan
+	errs  map[string]string
+}
+
+func newWSChecker(b *localBlobs, m *localManifests) *wsChecker {
+	return &wsChecker{blobs: b, manifests: m, turns: map[string]map[int64]turnSpan{}, errs: map[string]string{}}
+}
+
+type turnSpan struct {
+	ID          string
+	First, Last int64
+}
+
+func (c *wsChecker) check(ex *model.Exchange) string {
+	ws := ex.WS
+	if ws.Conn == "" || ws.Log == "" {
+		return "websocket turn without a connection or log"
+	}
+	conn, err := c.manifests.Read(ws.Conn)
+	if err != nil {
+		return fmt.Sprintf("connection %s unreadable: %v", ws.Conn, err)
+	}
+	if conn.ResRef != ws.Log {
+		return fmt.Sprintf("log %s is not connection %s's (%s)", ws.Log, ws.Conn, conn.ResRef)
+	}
+	if conn.Req.SessionID != ex.Req.SessionID {
+		return fmt.Sprintf("session %q differs from its connection's %q", ex.Req.SessionID, conn.Req.SessionID)
+	}
+	turns, msg := c.load(ex.Req.SessionID, ws.Log)
+	if msg != "" {
+		if ex.State == model.StateInflight {
+			return "" // its log may legitimately still be open elsewhere
+		}
+		return msg
+	}
+	t, ok := turns[ws.First]
+	// While the log is live a turn may still be growing, and a settled one is
+	// rewritten with its full range only when it ends; once the log is sealed
+	// nothing can extend it, so the range must be exactly the turn's.
+	sealed := !liveExists(c.blobs.dir, ws.Log)
+	switch {
+	case !ok:
+		return fmt.Sprintf("record %d of log %s is not a response.create", ws.First, ws.Log)
+	case t.ID == "":
+		return fmt.Sprintf("record %d of log %s has no turn record naming it", ws.First, ws.Log)
+	case t.ID != ex.ID:
+		return fmt.Sprintf("record %d of log %s belongs to turn %s", ws.First, ws.Log, t.ID)
+	case ws.Last < ws.First || ws.Last > t.Last:
+		return fmt.Sprintf("range %d..%d is outside the turn's %d..%d", ws.First, ws.Last, t.First, t.Last)
+	case sealed && ex.State == model.StateInflight:
+		return fmt.Sprintf("still inflight though log %s is sealed", ws.Log)
+	case sealed && ws.Last != t.Last:
+		return fmt.Sprintf("range %d..%d stops short of the turn's %d..%d", ws.First, ws.Last, t.First, t.Last)
+	}
+	return ""
+}
+
+func (c *wsChecker) load(session, ref string) (map[int64]turnSpan, string) {
+	if m, ok := c.turns[ref]; ok {
+		return m, c.errs[ref]
+	}
+	m := map[int64]turnSpan{}
+	c.turns[ref] = m
+	raw, err := c.blobs.Get(session, ref)
+	if err != nil {
+		c.errs[ref] = fmt.Sprintf("log %s unreadable: %v", ref, err)
+		return m, c.errs[ref]
+	}
+	if err := checkRecords(raw); err != nil {
+		c.errs[ref] = fmt.Sprintf("log %s: %v", ref, err)
+		return m, c.errs[ref]
+	}
+	rp := wire.NewReplayer()
+	wire.EachRecord(raw, func(rec wire.Record) bool {
+		if st := rp.Feed(rec); st.Ended != nil {
+			m[st.Ended.First] = turnSpan{st.Ended.ID, st.Ended.First, st.Ended.Last}
+		}
+		return true
+	})
+	if cur := rp.Current(); cur != nil {
+		m[cur.First] = turnSpan{cur.ID, cur.First, cur.Last}
+	}
+	return m, ""
 }

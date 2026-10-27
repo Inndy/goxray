@@ -49,7 +49,11 @@ type Turn struct {
 	// TerminalN is the record number of the latest terminal event, 0 if none.
 	TerminalN int64
 	StartedMS int64
-	EndedMS   int64
+	// EndedMS is when the turn's range ended: the next create, or the end of the
+	// log. TerminalMS is when its response did, which is what a duration means;
+	// the range can run on long after, to a connection that sat open idle.
+	EndedMS    int64
+	TerminalMS int64
 
 	// Create is the response.create frame exactly as sent.
 	Create []byte
@@ -199,7 +203,7 @@ func (r *Replayer) Feed(rec Record) Step {
 				t.final = ev.Response.Output
 			}
 		}
-		t.Terminal, t.TerminalN = typ, rec.N
+		t.Terminal, t.TerminalN, t.TerminalMS = typ, rec.N, rec.T
 		r.remember(t)
 	}
 	return Step{Turn: t, Held: IsHeldEvent(typ)}
@@ -266,6 +270,15 @@ func (t *Turn) Output() []json.RawMessage {
 		return t.output
 	}
 	return t.final
+}
+
+// DoneMS is when the turn finished as an exchange: its terminal event, or for
+// a turn that never got one, the end of its range. 0 while it is still open.
+func (t *Turn) DoneMS() int64 {
+	if t.TerminalMS > 0 {
+		return t.TerminalMS
+	}
+	return t.EndedMS
 }
 
 // FullInput returns the conversation the model saw for this turn.

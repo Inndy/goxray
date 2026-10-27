@@ -339,13 +339,20 @@ func (o ArchiveOptions) archiveSession(st *ArchiveStats, blobs *localBlobs, mani
 		if err != nil || ex.State == model.StateInflight {
 			continue
 		}
+		// A WebSocket turn whose connection is still open: its bytes are in a log
+		// that is still being written, and folding the turn now would pack a
+		// manifest whose body cannot be archived yet. It waits, like an inflight
+		// one.
+		if ex.WS != nil && liveExists(o.BlobsDir, ex.WS.Log) {
+			continue
+		}
 		if raw, err := manifests.readRaw(row.ID); err == nil {
 			mans = append(mans, sessionMan{id: row.ID, raw: raw, loose: loose})
 			if loose {
 				bytesFrom += int64(len(raw))
 			}
 		}
-		for _, ref := range []string{ex.ReqRef, ex.ResRef} {
+		for _, ref := range bodyRefs(ex) {
 			if ref == "" || seen[ref] {
 				continue
 			}

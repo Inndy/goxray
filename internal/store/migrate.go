@@ -97,6 +97,13 @@ func MigrateUsage(blobsDir, manifestsDir, archivesDir string, parser wire.WirePa
 			st.Skipped++
 			return nil
 		}
+		// What this recovers is what old Claude Code captures could not hold; an
+		// OpenAI record never lacked it, and parsing its bodies as Anthropic's
+		// would overwrite real fields with zeroes.
+		if ex.Provider != "" && ex.Provider != model.ProviderAnthropic {
+			st.Skipped++
+			return nil
+		}
 
 		changed := false
 

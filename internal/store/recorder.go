@@ -30,8 +30,9 @@ type Recorder struct {
 	blobs     BlobStore
 	manifests ManifestStore
 	idx       *Index
-	parser    wire.WireParser
-	provider  model.Provider
+	// provider is the default for a new exchange; a transport that knows better
+	// overrides it, and parsing follows the exchange's own provider.
+	provider model.Provider
 
 	obs  atomic.Pointer[Observer]
 	jobs chan model.Exchange
@@ -79,7 +80,6 @@ func NewRecorder(blobs BlobStore, manifests ManifestStore, idx *Index, provider 
 		blobs:     blobs,
 		manifests: manifests,
 		idx:       idx,
-		parser:    wire.For(provider),
 		provider:  provider,
 		jobs:      make(chan model.Exchange, 256),
 	}
@@ -118,9 +118,12 @@ func (r *Recorder) NewExchange(method, rawURL string, h http.Header) *model.Exch
 // the inflight manifest — all fsync'd. A non-nil error means the caller must
 // NOT forward and must return 502 (fail-closed: no unlogged traffic).
 func (r *Recorder) PersistRequest(ex *model.Exchange, rawReq []byte) error {
+	parser := wire.For(ex.Provider)
 	path := strings.SplitN(ex.URL, "?", 2)[0]
-	ex.IsNoise = r.parser.IsNoise(ex.Method, path, nil, rawReq)
-	ex.Req = r.parser.ParseRequest(nil, rawReq)
+	// The body is stored as received; only the parser sees it decoded.
+	body := wire.DecodeContent(ex.ReqHeaders["content-encoding"], rawReq)
+	ex.IsNoise = parser.IsNoise(ex.Method, path, nil, body)
+	ex.Req = parser.ParseRequest(headerOf(ex.ReqHeaders), body)
 	// The store's one trust boundary for a session id: it arrives from the
 	// request body and leaves here as something that can be a filename. Doing it
 	// per-parser would repeat it for every provider; doing it at each read would
@@ -155,7 +158,7 @@ func (r *Recorder) PersistResponse(ex *model.Exchange, rawRes []byte) error {
 	if ex.ResHeaders != nil {
 		ct = ex.ResHeaders["content-type"]
 	}
-	meta, ok := r.parser.ParseResponse(nil, rawRes, ct)
+	meta, ok := wire.For(ex.Provider).ParseResponse(nil, rawRes, ct)
 	meta.Cost = pricing.Price(meta, ex.Req.Model)
 	ex.Res = meta
 	ex.ParseOK = ok
@@ -223,7 +226,27 @@ func (r *Recorder) Close() {
 	r.wg.Wait()
 }
 
-var curatedReqKeys = []string{"anthropic-version", "anthropic-beta", "user-agent", "content-type"}
+// curatedReqKeys are the request headers worth keeping, for both providers.
+// Authorization and chatgpt-account-id are deliberately absent: invariant 4.
+var curatedReqKeys = []string{
+	"anthropic-version", "anthropic-beta", "user-agent", "content-type",
+	// Codex. x-codex-turn-metadata is left out: every frame carries it again in
+	// client_metadata, which is recorded verbatim.
+	"content-encoding", "originator", "version", "openai-beta",
+	"session-id", "thread-id", "x-client-request-id", "x-codex-window-id",
+	"x-codex-parent-thread-id", "x-openai-subagent", "x-codex-routing-hint",
+	"x-codex-beta-features",
+}
+
+// headerOf turns curated headers back into an http.Header for a parser, which
+// may fall back on them for identity a body does not carry.
+func headerOf(m map[string]string) http.Header {
+	h := http.Header{}
+	for k, v := range m {
+		h.Set(k, v)
+	}
+	return h
+}
 
 func curateReqHeaders(h http.Header) map[string]string {
 	out := map[string]string{}

@@ -13,3 +13,6 @@ func fsyncDir(dir string) error {
 	defer d.Close()
 	return d.Sync()
 }
+
+// renameOver is os.Rename; see the Windows version for why it exists.
+func renameOver(from, to string) error { return os.Rename(from, to) }
