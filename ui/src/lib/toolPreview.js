@@ -14,6 +14,17 @@ const firstLine = (s) => String(s ?? '').split('\n')[0]
 export function toolPreview(name, input) {
   const inp = input && typeof input === 'object' ? input : {}
   switch (name) {
+    case 'exec':
+      return truncate(firstLine(inp.input), 72)
+    case 'exec_command':
+      return truncate(firstLine(inp.cmd), 72)
+    case 'write_stdin':
+      return truncate(
+        `session ${inp.session_id ?? ''}${inp.chars ? `: ${inp.chars}` : ' (poll)'}`,
+        72,
+      )
+    case 'wait':
+      return String(inp.cell_id ?? '')
     case 'Bash':
       return truncate(firstLine(inp.command || inp.cmd), 72)
     case 'Read':
@@ -51,6 +62,7 @@ export function toolPreview(name, input) {
     case 'send_message':
     case 'followup_task':
     case 'close_agent':
+    case 'interrupt_agent':
       return String(inp.target ?? '')
     case 'wait_agent':
       return [].concat(inp.targets ?? inp.target ?? []).join(', ')
@@ -67,7 +79,7 @@ export function toolPreview(name, input) {
 
 function basename(p) {
   if (!p) return ''
-  const parts = String(p).split('/')
+  const parts = String(p).split(/[\\/]/)
   return parts[parts.length - 1] || String(p)
 }
 

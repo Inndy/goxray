@@ -25,7 +25,13 @@ const lineCount = computed(() => (outText.value ? outText.value.split('\n').leng
 // Codex's multi-agent calls name another agent. Following one should land on
 // that agent's own turns, which is the step a reader tracking a sub-agent takes
 // next: from "spawned count_go" to what count_go then did.
-const AGENT_CALLS = ['spawn_agent', 'send_message', 'followup_task', 'close_agent']
+const AGENT_CALLS = [
+  'spawn_agent',
+  'send_message',
+  'followup_task',
+  'close_agent',
+  'interrupt_agent',
+]
 const router = useRouter()
 const agentTarget = computed(() => {
   const c = call.value

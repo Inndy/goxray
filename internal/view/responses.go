@@ -215,6 +215,19 @@ func itemsToMessages(items []json.RawMessage, enc EncryptedParams) []msg {
 		out = append(out, msg{Role: role, Content: []json.RawMessage{block}})
 	}
 	for _, raw := range items {
+		// Keep message parts separate: the client can put harness context and
+		// human text in different parts of the same user message.
+		var it respItem
+		if json.Unmarshal(raw, &it) == nil && (it.Type == "message" || it.Type == "") {
+			role := it.Role
+			if role == "developer" {
+				role = "system"
+			}
+			for _, text := range contentTexts(it.Content) {
+				push(role, textBlock(text))
+			}
+			continue
+		}
 		role, block := convertItem(raw, enc)
 		if block != nil {
 			push(role, block)
@@ -261,6 +274,10 @@ func convertItem(raw json.RawMessage, enc EncryptedParams) (string, json.RawMess
 		return "user", b
 	case "compaction":
 		return "system", textBlock("[compaction: the earlier conversation, summarised by the server and encrypted]")
+	case "configuration_update":
+		// Client settings in Responses Lite are context, not tool invocations.
+		// Keep their values readable without inventing a call id or result.
+		return "system", textBlock("[configuration update]\n" + string(raw))
 	case "agent_message":
 		// Delivered to the model by Codex, not typed by anyone, so it reads as
 		// context: a task from the parent, or a sub-agent's answer coming back.

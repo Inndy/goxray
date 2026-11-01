@@ -6,6 +6,34 @@ import (
 	"testing"
 )
 
+func TestFromResponsesPreservesHarnessAndHumanParts(t *testing.T) {
+	req := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>cwd</environment_context>"},{"type":"input_text","text":"Review the parser"},{"type":"input_text","text":"<codex_internal_context source=\"goal\">goal</codex_internal_context>"}]}]}`)
+	var out struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(FromResponses(req), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Messages) != 1 || out.Messages[0].Role != "user" || len(out.Messages[0].Content) != 3 {
+		t.Fatalf("message parts were flattened: %+v", out)
+	}
+	if out.Messages[0].Content[1].Text != "Review the parser" {
+		t.Fatal("human text changed")
+	}
+}
+
+func TestFromResponsesConfigurationIsContext(t *testing.T) {
+	out := string(FromResponses([]byte(`{"input":[{"type":"configuration_update","reasoning":{"effort":"high"}},{"type":"message","role":"user","content":"hi"}]}`)))
+	if strings.Contains(out, `"tool_use"`) || !strings.Contains(out, `"role":"system"`) || !strings.Contains(out, `[configuration update]`) || !strings.Contains(out, `high`) {
+		t.Fatalf("configuration rendered as a call or lost: %s", out)
+	}
+}
+
 // A call into a namespace names the namespace and the tool separately; it must
 // come out under the same flat name as the definition it calls, or the timeline
 // shows a tool the catalog does not have.

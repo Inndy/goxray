@@ -4,7 +4,7 @@ import { toolPreview } from './toolPreview.js'
 // typed. Two shapes exist and both matter: tag-wrapped context blocks, and bare
 // notification text with no wrapper at all.
 const INJECTED_TAG_RE =
-  /^<(system-reminder|user-prompt-submit-hook|context|local-command-caveat|antml:function_calls)[^>]*>/
+  /^<(system-reminder|user-prompt-submit-hook|context|local-command-caveat|antml:function_calls|codex_internal_context|environment_context|permissions instructions|collaboration_mode)(?:\s[^>]*|)>/
 
 // Background-task results arrive as ordinary user messages carrying no tag. They
 // run to tens of thousands of characters, so treating them as human input would
