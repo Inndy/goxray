@@ -59,12 +59,18 @@ type Filter struct {
 	Offset       int
 	Since        int64
 	IncludeNoise bool
+	TitleOnly    bool
+	Until        int64
 }
 
 // Matches applies the same filter to an exchange that is not in the index yet:
 // the inflight overlay must hide exactly what the query would.
 func (f Filter) Matches(e *model.Exchange) bool {
 	switch {
+	case f.TitleOnly && (e.Provider != model.ProviderOpenAI || e.Res.Title == ""):
+		return false
+	case f.Until > 0 && e.StartedAt.UnixMilli() > f.Until:
+		return false
 	case f.Session != "" && e.Req.SessionID != f.Session,
 		f.Thread != "" && e.Req.Thread != f.Thread,
 		f.Source != "" && e.Source != f.Source,
@@ -79,6 +85,13 @@ func (f Filter) Matches(e *model.Exchange) bool {
 func (f Filter) where() (string, []any) {
 	var args []any
 	var parts []string
+	if f.Until > 0 {
+		parts = append(parts, "ts <= ?")
+		args = append(args, f.Until)
+	}
+	if f.TitleOnly {
+		parts = append(parts, "provider = 'openai' AND title != ''")
+	}
 	if f.Session != "" {
 		parts = append(parts, "session = ?")
 		args = append(args, f.Session)
@@ -360,20 +373,23 @@ func scanEntry(rows *sql.Rows) (model.Exchange, error) {
 // maintained side file — the index is already the projection, so there is no
 // second thing to keep in sync or reconcile.
 type Session struct {
-	SessionID    string   `json:"session_id"`
-	Cwd          string   `json:"cwd"`
-	Model        string   `json:"model"`
-	Title        string   `json:"title"`
-	Turns        int      `json:"turns"`
-	Subagents    int      `json:"subagents"`
-	Cost         float64  `json:"cost"`
-	InputTokens  int      `json:"input_tokens"`
-	OutputTokens int      `json:"output_tokens"`
-	CacheRead    int      `json:"cache_read"`
-	CacheCreate  int      `json:"cache_create"`
-	FirstTS      int64    `json:"first_ts"`
-	LastTS       int64    `json:"last_ts"`
-	Sources      []string `json:"sources"`
+	SessionID     string   `json:"session_id"`
+	Cwd           string   `json:"cwd"`
+	Model         string   `json:"model"`
+	Title         string   `json:"title"`
+	TitleSource   string   `json:"title_source,omitempty"`
+	TitleExchange string   `json:"title_exchange,omitempty"`
+	Providers     []string `json:"providers,omitempty"`
+	Turns         int      `json:"turns"`
+	Subagents     int      `json:"subagents"`
+	Cost          float64  `json:"cost"`
+	InputTokens   int      `json:"input_tokens"`
+	OutputTokens  int      `json:"output_tokens"`
+	CacheRead     int      `json:"cache_read"`
+	CacheCreate   int      `json:"cache_create"`
+	FirstTS       int64    `json:"first_ts"`
+	LastTS        int64    `json:"last_ts"`
+	Sources       []string `json:"sources"`
 }
 
 // querySessions rolls entries up by session. Model/cwd/title come from
@@ -391,7 +407,8 @@ func querySessions(db *sql.DB, f Filter) ([]Session, error) {
 	    COALESCE(GROUP_CONCAT(DISTINCT source),''),
 	    COALESCE((SELECT t.model FROM entries t WHERE t.session=e.session AND t.model!='' ORDER BY t.ts DESC LIMIT 1),''),
 	    COALESCE((SELECT t.cwd   FROM entries t WHERE t.session=e.session AND t.cwd  !='' ORDER BY t.ts DESC LIMIT 1),''),
-	    COALESCE((SELECT t.title FROM entries t WHERE t.session=e.session AND t.title!='' ORDER BY t.ts DESC LIMIT 1),'')
+	    COALESCE((SELECT t.title FROM entries t WHERE t.session=e.session AND t.title!='' ORDER BY t.ts DESC LIMIT 1),''),
+	    COALESCE(GROUP_CONCAT(DISTINCT provider),'')
 	  FROM entries e` + where + ` GROUP BY session ORDER BY MAX(ts) DESC` + tail
 	rows, err := db.Query(q, append(args, tailArgs...)...)
 	if err != nil {
@@ -402,15 +419,20 @@ func querySessions(db *sql.DB, f Filter) ([]Session, error) {
 	out := []Session{}
 	for rows.Next() {
 		var s Session
-		var sources string
+		var sources, providers string
 		if err := rows.Scan(&s.SessionID, &s.Turns, &s.Subagents, &s.Cost,
 			&s.InputTokens, &s.OutputTokens, &s.CacheRead, &s.CacheCreate,
-			&s.FirstTS, &s.LastTS, &sources, &s.Model, &s.Cwd, &s.Title); err != nil {
+			&s.FirstTS, &s.LastTS, &sources, &s.Model, &s.Cwd, &s.Title, &providers); err != nil {
 			return nil, err
 		}
 		// Always an array, never null: a nil slice would marshal to JSON null and
 		// break every client that treats this as a list.
 		s.Sources = []string{}
+		for p := range strings.SplitSeq(providers, ",") {
+			if p != "" {
+				s.Providers = append(s.Providers, p)
+			}
+		}
 		for src := range strings.SplitSeq(sources, ",") {
 			if src != "" {
 				s.Sources = append(s.Sources, src)

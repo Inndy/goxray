@@ -89,6 +89,19 @@ Frontend development: `make ui-dev` runs vite on :5173 proxying `/api` to :5600.
 `make ui` writes the production bundle into `internal/web/dist`, which is
 committed and embedded.
 
+Session rows label recorded providers as **Codex** or **Claude Code** (both
+when a session contains both). Codex automatic titles are derived only from
+proxy recordings: a hidden title-generation request must match the original
+user prompt in exactly one root session with the same source within five
+minutes before or after title generation. Unicode-safe truncation is accounted for.
+These titles are marked **inferred title**, with the title exchange ID in the
+tooltip/API, and never overwrite a recorded session title or modify audit data.
+The view refreshes its inference cache every 30 seconds when sessions are read,
+examining the latest 1,000 title records and skipping windows with 512 or more
+candidates. Missing records, ambiguous matches and unsupported prompt formats
+keep the usual fallback label. Local Codex files are not consulted; manual
+renames and recent-conversation rename suggestions cannot be recovered this way.
+
 ## How it records (fail-closed)
 
 ```

@@ -55,7 +55,35 @@ const label = (s) =>
         :class="{ active: s.session_id === selected }"
         @click="emit('select', s.session_id === selected ? '' : s.session_id)"
       >
-        <div class="title">{{ label(s) }}</div>
+        <div
+          class="title"
+          :title="
+            s.title_source === 'proxy_inferred'
+              ? `Title inferred from proxy record ${s.title_exchange}`
+              : ''
+          "
+        >
+          {{ label(s) }}
+        </div>
+        <div class="row small">
+          <NTag
+            v-for="provider in s.providers || []"
+            :key="provider"
+            size="tiny"
+            :bordered="false"
+            :type="provider === 'openai' ? 'success' : 'info'"
+          >
+            {{
+              provider === 'openai' ? 'Codex' : provider === 'anthropic' ? 'Claude Code' : provider
+            }}
+          </NTag>
+          <span
+            v-if="s.title_source === 'proxy_inferred'"
+            class="muted"
+            title="Matched by prompt, source and time; target thread ID is absent from the wire"
+            >inferred title</span
+          >
+        </div>
         <div class="row small muted">
           <span>{{ s.turns }}t</span>
           <span v-if="s.subagents">↳{{ s.subagents }}</span>

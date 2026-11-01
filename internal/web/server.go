@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.inndy.tw/goxray/internal/model"
@@ -70,8 +71,11 @@ const (
 )
 
 type server struct {
-	rd  Reader
-	hub *Hub
+	rd           Reader
+	hub          *Hub
+	titleMu      sync.Mutex
+	titleRefresh time.Time
+	titles       map[string]inferredTitle
 }
 
 // Handler builds the dashboard handler. hub may be nil, in which case live
@@ -137,7 +141,9 @@ func (s *server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, map[string]any{"sessions": s.mergeInflightSessions(sessions, f)})
+	sessions = s.mergeInflightSessions(sessions, f)
+	s.overlayCodexTitles(sessions)
+	writeJSON(w, map[string]any{"sessions": sessions})
 }
 
 // mergeInflightSessions overlays sessions that exist only as streaming turns, on
@@ -175,6 +181,9 @@ func (s *server) mergeInflightSessions(rows []store.Session, f store.Filter) []s
 			at[e.Req.SessionID] = i
 		}
 		r := &rows[i]
+		if e.Provider != "" && !slices.Contains(r.Providers, string(e.Provider)) {
+			r.Providers = append(r.Providers, string(e.Provider))
+		}
 		r.Turns++
 		if e.Req.IsSubagent {
 			r.Subagents++
