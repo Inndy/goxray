@@ -514,14 +514,14 @@ light theme.
 ## Working in this repo
 
 ```bash
-make build        # pnpm build into internal/web/dist, then go build
+make build        # vp build into internal/web/dist, then go build
 make ui           # bundle only
-make ui-dev       # vite :5173, proxies /api to a dashboard on :5600
+make ui-dev       # vp dev :5173, proxies /api to a dashboard on :5600
 make test         # go test ./...
 go build ./cmd/goxray             # no Node needed; dist is committed
 
-pnpm -C ui lint    # oxlint + eslint, both with --fix
-pnpm -C ui format  # oxfmt src/
+make ui-check      # vp check: format, lint, type-check (no writes)
+cd ui && vp check --fix   # apply format and lint fixes
 ```
 
 Run the dashboard: `./goxray --port 5599 --ui-port 5600`

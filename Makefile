@@ -1,4 +1,4 @@
-.PHONY: all build ui ui-dev test clean
+.PHONY: all build ui ui-dev ui-check test clean
 
 all: build
 
@@ -13,13 +13,17 @@ build: ui
 	go build ./cmd/goxray
 
 ui:
-	pnpm -C ui install
-	pnpm -C ui build
+	cd ui && vp install
+	cd ui && vp build
 
 # Frontend iteration: vite on :5173 proxying /api to a dashboard on :5600.
 # Run `./goxray --port 5599 --ui-port 5600` alongside this.
 ui-dev:
-	pnpm -C ui dev
+	cd ui && vp dev
+
+# Format, lint and type-check the UI (Vite+: oxfmt + oxlint).
+ui-check:
+	cd ui && vp check
 
 test:
 	go test ./...
